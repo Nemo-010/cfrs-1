@@ -173,7 +173,7 @@ build them once first:
 ```
 (cd testdata/sg && CGO_ENABLED=0 go build -o sg .)
 (cd testdata/gs && CGO_ENABLED=0 go build -o gs .)
-cc -O1 -o testdata/cdyn/cdyn testdata/cdyn.c
+mkdir -p testdata/cdyn && cc -O1 -o testdata/cdyn/cdyn testdata/cdyn.c
 cc -O1 -o testdata/relayer testdata/relayer.c
 cc -O1 -o testdata/srv     testdata/srv.c
 cc -O1 -o testdata/ucli    testdata/ucli.c

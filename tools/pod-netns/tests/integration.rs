@@ -36,7 +36,7 @@ fn child() -> std::path::PathBuf {
 const FIXTURES: &[(&str, &str)] = &[
     ("testdata/sg/sg", "(cd testdata/sg && CGO_ENABLED=0 go build -o sg .)"),
     ("testdata/gs/gs", "(cd testdata/gs && CGO_ENABLED=0 go build -o gs .)"),
-    ("testdata/cdyn/cdyn", "cc -O1 -o testdata/cdyn/cdyn testdata/cdyn.c"),
+    ("testdata/cdyn/cdyn", "mkdir -p testdata/cdyn && cc -O1 -o testdata/cdyn/cdyn testdata/cdyn.c"),
     ("testdata/relayer", "cc -O1 -o testdata/relayer testdata/relayer.c"),
     ("testdata/srv", "cc -O1 -o testdata/srv testdata/srv.c"),
     ("testdata/ucli", "cc -O1 -o testdata/ucli testdata/ucli.c"),
@@ -49,18 +49,21 @@ const FIXTURES: &[(&str, &str)] = &[
 #[test]
 fn every_fixture_is_built() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let missing: Vec<&str> = FIXTURES
+    // The fixture paths are relative to the crate, so the printed commands are
+    // only correct if run from there, and creating the one directory that has no
+    // committed member means the printed command works verbatim on a fresh
+    // checkout rather than failing on a missing directory.
+    let _ = std::fs::create_dir_all(root.join("testdata/cdyn"));
+    let missing: Vec<String> = FIXTURES
         .iter()
         .filter(|(path, _)| !root.join(path).exists())
-        .map(|(path, cmd)| {
-            Box::leak(format!("{path}   (build with: {cmd})").into_boxed_str())
-                as &str
-        })
+        .map(|(path, cmd)| format!("{path}   (build with: {cmd})"))
         .collect();
     assert!(
         missing.is_empty(),
         "these fixtures are missing, so the tests that use them are skipping \
-rather than running, and cargo test would report a green run anyway:\n  {}",
+rather than running, and cargo test would report a green run anyway. Run these \
+from the crate directory:\n  {}",
         missing.join("\n  ")
     );
 }
