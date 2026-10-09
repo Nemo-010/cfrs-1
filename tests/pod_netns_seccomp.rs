@@ -693,3 +693,32 @@ fn seccomp_backend_proxies_ipv6_targets() {
     assert_eq!(rx.recv().unwrap(), "2001:db8::1:80");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn seccomp_backend_uses_an_ambient_proxy() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-env-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("socks.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (tx, _rx) = mpsc::channel();
+    std::thread::spawn(move || socks5_proxy(listener, tx, false));
+
+    let program = build_program(&dir, "client-env", CLIENT, false);
+    // No -x: the proxy comes from the environment.
+    let output = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--backend", "seccomp", "--"])
+        .arg(&program)
+        .env("ALL_PROXY", format!("socks5://unix:{}", sock.display()))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("READ:18:HELLO-FROM-TARGET"),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

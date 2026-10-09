@@ -142,6 +142,20 @@ impl Proxy {
             Some((s, r)) => (s, r),
             None => ("socks5", spec),
         };
+        // socks5://unix:/path — a SOCKS5 proxy reached over a unix socket.
+        if let Some(path) = rest.strip_prefix("unix:") {
+            if !path.is_empty() && (scheme == "socks5" || scheme == "socks5h" || scheme == "socks")
+            {
+                return Ok(Self {
+                    kind: ProxyKind::Socks5,
+                    host: String::new(),
+                    port: 0,
+                    user: None,
+                    pass: None,
+                    unix_path: Some(path.to_string()),
+                });
+            }
+        }
         let kind = match scheme {
             "socks5" | "socks5h" | "socks" => ProxyKind::Socks5,
             "http" | "https" => ProxyKind::Http,
@@ -357,6 +371,27 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 i += 2;
             }
             other => bail!("unexpected argument {other:?}; see --help"),
+        }
+    }
+    // An ambient proxy is used when no -x is given, so the tool composes with
+    // whatever the environment already names.
+    if proxies.is_empty() {
+        for var in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            if let Ok(value) = std::env::var(var) {
+                if !value.is_empty() {
+                    if let Ok(proxy) = Proxy::parse(&value) {
+                        proxies.push(proxy);
+                        break;
+                    }
+                }
+            }
         }
     }
     if !doctor && serve.is_none() && program.is_empty() {
