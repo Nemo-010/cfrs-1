@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -160,6 +160,29 @@ int main(void) {
     char b[64] = {0};
     int n = read(s, b, sizeof b - 1);
     printf("READ:%d:%s", n, b);
+    return 0;
+}
+"#;
+
+const SERVER: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+int main(void) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(8080);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); return 1; }
+    if (listen(s, 4) < 0) { perror("listen"); return 1; }
+    int c = accept(s, NULL, NULL);
+    if (c < 0) { perror("accept"); return 1; }
+    char b[64] = {0};
+    int n = read(c, b, sizeof b - 1);
+    if (n <= 0) return 1;
+    write(c, "PONG\n", 5);
     return 0;
 }
 "#;
@@ -322,5 +345,90 @@ fn seccomp_backend_relays_udp() {
     let program = build_program(&dir, "udp-client", UDP_CLIENT, false);
     let stdout = run(&dir, &[&sock], &program);
     assert!(stdout.contains("UDP:9:ECHO:PING"), "{stdout:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn seccomp_backend_routes_by_rule() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-route-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("p1.sock");
+    let p2 = dir.join("p2.sock");
+    let l1 = UnixListener::bind(&p1).unwrap();
+    let l2 = UnixListener::bind(&p2).unwrap();
+    let (tx1, rx1) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+    std::thread::spawn(move || socks5_proxy(l1, tx1, false));
+    std::thread::spawn(move || socks5_proxy(l2, tx2, false));
+
+    let program = build_program(&dir, "client-route", CLIENT, false);
+    let output = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--backend", "seccomp", "-x"])
+        .arg(format!("unix:{}", p1.display()))
+        .args(["-r"])
+        .arg(format!("cidr:93.184.0.0/16=unix:{}", p2.display()))
+        .arg("--")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("READ:18:HELLO-FROM-TARGET"));
+    // The rule proxy saw it; the default did not.
+    assert_eq!(rx2.recv().unwrap(), "93.184.216.34:80");
+    assert!(
+        rx1.try_recv().is_err(),
+        "the default proxy must not be used"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn seccomp_backend_accepts_inbound() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-inbound-{}", std::process::id()));
+    let inbound = dir.join("in");
+    std::fs::create_dir_all(&inbound).unwrap();
+    let proxy = dir.join("socks.sock");
+    let listener = UnixListener::bind(&proxy).unwrap();
+    let (tx, _rx) = mpsc::channel();
+    std::thread::spawn(move || socks5_proxy(listener, tx, false));
+
+    let server = build_program(&dir, "server", SERVER, false);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--backend", "seccomp", "--inbound-dir"])
+        .arg(&inbound)
+        .args(["-x"])
+        .arg(format!("unix:{}", proxy.display()))
+        .arg("--")
+        .arg(&server)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // The listener is a unix socket named after the bound port.
+    let sockpath = inbound.join("8080.sock");
+    let mut conn = None;
+    for _ in 0..100 {
+        if let Ok(c) = UnixStream::connect(&sockpath) {
+            conn = Some(c);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = conn.expect("the inbound listener did not appear");
+    c.write_all(b"PING\n").unwrap();
+    let mut buf = [0u8; 16];
+    let n = c.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"PONG\n");
+    drop(c);
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }

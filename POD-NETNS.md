@@ -154,15 +154,43 @@ syscalls, so a program using `IORING_OP_SOCKET`/`IORING_OP_CONNECT` would slip
 past the filter entirely. `io_uring_setup` is intercepted and answered `EPERM`.
 This sandbox already denies it, but the filter must not depend on that.
 
-### What is still open
+### Routing, inbound, and the closed bypass
 
-- **Per-destination routing** (`--rule domain:…=PROXY`, `cidr:…=PROXY`) is the
-  obvious next step: `connect_upstream_async` already takes a slice of hops, so
-  it needs a rule table and one call site, not new plumbing.
-- **Inbound** (`bind`/`listen`/`accept`) is answered only for the injected
-  socketpairs, so a server cannot be reached from outside yet.
-- **`getsockname`/`getpeername` faking** is limited: writing the child's memory
-  needs `O_RDWR` on `/proc/<pid>/mem`, which this host denies, so those calls
-  fall through to the kernel and report the `AF_UNIX` address.
-- **`io_uring`-based `recvmsg`** would also bypass, so denying the whole
-  interface is deliberate rather than partial.
+**Per-destination routing.** `-r domain:NAME=PROXY` and `-r cidr:ADDR/PREFIX=PROXY`
+select a single hop per destination, first match wins, and `-x` remains the
+default chain. `select_chain` is one function and one call site.
+
+```sh
+pod-netns --backend seccomp -x unix:/run/default.sock \
+    -r cidr:10.0.0.0/8=unix:/run/internal.sock -- ./prog
+```
+
+**Inbound.** `bind` records the requested address, `listen` creates the only
+listener a sealed host can have — a unix socket at
+`$--inbound-dir/<port>.sock` — and a reader task queues accepted connections;
+`accept`/`accept4` draw one and install a socketpair end in the child. The
+program sees a normal `bind`/`listen`/`accept` sequence. The listener is exposed
+to the tailnet with stock Tailscale:
+
+```sh
+tailscale serve --bg --tcp 8080 unix:/tmp/pod-netns-inbound/8080.sock
+```
+
+**`io_uring` is denied completely, not partially.** `io_uring_setup`,
+`io_uring_enter` and `io_uring_register` are all answered `EPERM`. A partial
+filter would be unsound: the kernel performs the submitted network operations
+itself, so there is no syscall for the filter to see. Denying the interface is
+the only correct answer, and `the_filter_covers_the_bypass_surfaces` asserts it.
+
+### Remaining host limits
+
+**`getsockname`/`getpeername` address rewriting.** The supervisor needs
+`O_RDWR` on `/proc/<pid>/mem` to write a fake `sockaddr` into the child. This
+host denies it (`EACCES`; `PR_SET_DUMPABLE=1` does not change that), as it denies
+`process_vm_writev` and ptrace. The code implements the write path — it works
+where the host allows it — and otherwise falls through, so the kernel reports
+the `AF_UNIX` peer. `pod-netns doctor` reports `write /proc/<pid>/mem` so the
+limitation is visible before it matters. Programs that merely log the address
+are unaffected; programs that require an `AF_INET` value from `getpeername` are
+not supported on such a host.
+

@@ -154,6 +154,53 @@ impl Proxy {
     }
 }
 
+// ── per-destination routing ─────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+enum RuleMatch {
+    Domain(String),
+    Cidr(Ipv4Addr, u8),
+}
+
+#[derive(Clone, Debug)]
+struct Rule {
+    matcher: RuleMatch,
+    proxy: Proxy,
+}
+
+fn in_cidr(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - prefix as u32);
+    (u32::from(ip) & mask) == (u32::from(net) & mask)
+}
+
+/// First matching rule wins; otherwise the default `-x` chain. A rule is a
+/// single hop; the default is a chain.
+fn select_chain<'a>(rules: &'a [Rule], default: &'a [Proxy], target: &str) -> &'a [Proxy] {
+    let host = target.rsplit_once(':').map_or(target, |(h, _)| h);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: Option<IpAddr> = bare.parse().ok();
+    for rule in rules {
+        match &rule.matcher {
+            RuleMatch::Domain(d) => {
+                if d.eq_ignore_ascii_case(host) {
+                    return std::slice::from_ref(&rule.proxy);
+                }
+            }
+            RuleMatch::Cidr(net, prefix) => {
+                if let Some(IpAddr::V4(v4)) = ip {
+                    if in_cidr(v4, *net, *prefix) {
+                        return std::slice::from_ref(&rule.proxy);
+                    }
+                }
+            }
+        }
+    }
+    default
+}
+
 // ── command line ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -165,9 +212,11 @@ enum BackendKind {
 
 struct Args {
     proxies: Vec<Proxy>,
+    rules: Vec<Rule>,
     program: Vec<String>,
     doctor: bool,
     verbose: bool,
+    inbound_dir: std::path::PathBuf,
     backend: BackendKind,
 }
 
@@ -193,10 +242,12 @@ The first proxy is the default route. Requires unprivileged user namespaces and
 
 fn parse_args(argv: &[String]) -> Result<Args> {
     let mut proxies = Vec::new();
+    let mut rules = Vec::new();
     let mut program = Vec::new();
     let mut doctor = false;
     let mut verbose = false;
     let mut backend = BackendKind::Auto;
+    let mut inbound_dir = std::path::PathBuf::from("/tmp/pod-netns-inbound");
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -221,6 +272,37 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 proxies.push(Proxy::parse(spec)?);
                 i += 2;
             }
+            "-r" | "--rule" => {
+                let spec = argv.get(i + 1).context("--rule needs a value")?;
+                let (lhs, rhs) = spec
+                    .split_once('=')
+                    .context("--rule needs KIND:VALUE=PROXY")?;
+                let (kind, value) = lhs.split_once(':').context("--rule needs KIND:VALUE")?;
+                let matcher = match kind {
+                    "domain" => RuleMatch::Domain(value.to_string()),
+                    "cidr" => {
+                        let (net, prefix) = value
+                            .split_once('/')
+                            .context("cidr rule needs ADDR/PREFIX")?;
+                        RuleMatch::Cidr(
+                            net.parse().context("cidr address")?,
+                            prefix.parse().context("cidr prefix")?,
+                        )
+                    }
+                    other => bail!("unknown rule kind {other:?} (domain, cidr)"),
+                };
+                rules.push(Rule {
+                    matcher,
+                    proxy: Proxy::parse(rhs)?,
+                });
+                i += 2;
+            }
+            "--inbound-dir" => {
+                inbound_dir = std::path::PathBuf::from(
+                    argv.get(i + 1).context("--inbound-dir needs a value")?,
+                );
+                i += 2;
+            }
             "--backend" => {
                 let value = argv.get(i + 1).context("--backend needs a value")?;
                 backend = match value.as_str() {
@@ -239,9 +321,11 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     }
     Ok(Args {
         proxies,
+        rules,
         program,
         doctor,
         verbose,
+        inbound_dir,
         backend,
     })
 }
@@ -412,6 +496,34 @@ fn probe_seccomp_notif() -> Probe {
     }
 }
 
+/// Can the supervisor write a child's memory? That is what faking
+/// `getsockname`/`getpeername`/`accept` addresses needs.
+fn probe_mem_write() -> Probe {
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        let mut b = [0u8; 1];
+        unsafe { libc::read(0, b.as_mut_ptr() as *mut _, 0) };
+        unsafe { libc::_exit(0) };
+    }
+    let path = CString::new(format!("/proc/{pid}/mem")).unwrap();
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    let (ok, detail) = if fd >= 0 {
+        unsafe { libc::close(fd) };
+        (true, "O_RDWR on /proc/<pid>/mem".to_string())
+    } else {
+        (false, format!("{}", std::io::Error::last_os_error()))
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+    Probe {
+        name: "write /proc/<pid>/mem",
+        ok,
+        detail,
+    }
+}
+
 fn doctor() -> i32 {
     let probes = [
         probe_unshare(libc::CLONE_NEWNET),
@@ -419,6 +531,7 @@ fn doctor() -> i32 {
         probe_tun(),
         probe_ptrace(),
         probe_seccomp_notif(),
+        probe_mem_write(),
     ];
     println!("pod-netns: capability report");
     for p in &probes {
@@ -1523,6 +1636,58 @@ mod tests {
     }
 
     #[test]
+    fn the_filter_covers_the_bypass_surfaces() {
+        let syscalls = intercepted_syscalls();
+        for required in [
+            libc::SYS_socket,
+            libc::SYS_connect,
+            libc::SYS_sendto,
+            libc::SYS_sendmsg,
+            libc::SYS_sendmmsg,
+            libc::SYS_setsockopt,
+            libc::SYS_listen,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert!(
+                syscalls.contains(&required),
+                "syscall {required} is not intercepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_select_chains_in_order() {
+        let default = vec![Proxy::parse("socks5://127.0.0.1:1").unwrap()];
+        let rules = vec![
+            Rule {
+                matcher: RuleMatch::Domain("example.com".into()),
+                proxy: Proxy::parse("socks5://127.0.0.1:2").unwrap(),
+            },
+            Rule {
+                matcher: RuleMatch::Cidr("10.0.0.0".parse().unwrap(), 8),
+                proxy: Proxy::parse("socks5://127.0.0.1:3").unwrap(),
+            },
+        ];
+        assert_eq!(select_chain(&rules, &default, "example.com:80")[0].port, 2);
+        assert_eq!(select_chain(&rules, &default, "EXAMPLE.com:443")[0].port, 2);
+        assert_eq!(select_chain(&rules, &default, "10.1.2.3:443")[0].port, 3);
+        assert_eq!(select_chain(&rules, &default, "1.2.3.4:80")[0].port, 1);
+    }
+
+    #[test]
+    fn cidr_matching_is_exact() {
+        let net: Ipv4Addr = "10.0.0.0".parse().unwrap();
+        assert!(in_cidr("10.0.0.1".parse().unwrap(), net, 8));
+        assert!(in_cidr("10.255.255.255".parse().unwrap(), net, 8));
+        assert!(!in_cidr("11.0.0.1".parse().unwrap(), net, 8));
+        assert!(in_cidr("1.2.3.4".parse().unwrap(), net, 0));
+    }
+
+    #[test]
     fn parses_a_tcp_syn() {
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x45; // IPv4, IHL 5
@@ -1608,7 +1773,7 @@ struct SeccompNotifAddfd {
 }
 
 /// The syscalls the filter stops. Everything else is allowed untouched.
-fn intercepted_syscalls() -> [libc::c_long; 11] {
+fn intercepted_syscalls() -> [libc::c_long; 16] {
     [
         libc::SYS_socket,
         libc::SYS_connect,
@@ -1621,6 +1786,11 @@ fn intercepted_syscalls() -> [libc::c_long; 11] {
         libc::SYS_setsockopt,
         libc::SYS_getsockopt,
         libc::SYS_io_uring_setup,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ]
 }
 
@@ -1828,8 +1998,20 @@ struct UdpRelay {
     _control: Upstream,
 }
 
+/// A listening socket inside the sandbox. Connections arrive on a unix
+/// listener (the only bind a sealed host permits) and are handed to the child's
+/// `accept` as injected socketpair ends.
+struct Inbound {
+    rx: tokio::sync::mpsc::UnboundedReceiver<tokio::net::UnixStream>,
+    path: std::path::PathBuf,
+}
+
 enum Sock {
-    Stream(tokio::net::UnixStream),
+    Stream {
+        pair: tokio::net::UnixStream,
+        bound: Option<(IpAddr, u16)>,
+        inbound: Option<Inbound>,
+    },
     Datagram {
         pair: Arc<tokio::net::UnixDatagram>,
         dest: Option<(IpAddr, u16)>,
@@ -1902,14 +2084,23 @@ fn run_seccomp(args: Args) -> Result<i32> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(supervise_seccomp(lfd, pid, args.proxies, args.verbose))
+    runtime.block_on(supervise_seccomp(
+        lfd,
+        pid,
+        args.proxies,
+        args.rules,
+        args.verbose,
+        args.inbound_dir,
+    ))
 }
 
 async fn supervise_seccomp(
     lfd: RawFd,
     pid: i32,
     proxies: Vec<Proxy>,
+    rules: Vec<Rule>,
     verbose: bool,
+    inbound_dir: std::path::PathBuf,
 ) -> Result<i32> {
     // NOTIF_RECV is non-blocking so the shutdown flag is observed; the fd is
     // also pollable, so the loop sleeps on readiness rather than spinning.
@@ -1927,7 +2118,14 @@ async fn supervise_seccomp(
         mem = unsafe { libc::open(mem_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     }
     if mem < 0 {
-        bail!("open /proc/{pid}/mem: {}", std::io::Error::last_os_error());
+        // The child may have exited already; that is not a supervisor failure.
+        mem_writable = false;
+        if verbose {
+            eprintln!(
+                "pod-netns: /proc/{pid}/mem unavailable: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1972,7 +2170,10 @@ async fn supervise_seccomp(
         let outcome = if nr == libc::SYS_socket as i32 {
             handle_socket(lfd, id, a, &mut map)
         } else if nr == libc::SYS_connect as i32 {
-            handle_connect(lfd, id, a, mem, &mut map, &mut dns, &proxies, verbose).await
+            handle_connect(
+                lfd, id, a, mem, &mut map, &mut dns, &proxies, &rules, verbose,
+            )
+            .await
         } else if nr == libc::SYS_sendto as i32 {
             handle_sendto(lfd, id, a, mem, &mut map, &mut dns, &proxies).await
         } else if nr == libc::SYS_sendmsg as i32 {
@@ -1994,13 +2195,11 @@ async fn supervise_seccomp(
             // syscalls, which would bypass this filter entirely. Refuse it.
             notif_respond(lfd, id, -1, libc::EPERM)
         } else if nr == libc::SYS_bind as i32 {
-            // A datagram socket that binds a local port is a socketpair here;
-            // pretend the bind succeeded.
-            if map.contains_key(&(a[0] as i32)) {
-                notif_respond(lfd, id, 0, 0)
-            } else {
-                notif_continue(lfd, id)
-            }
+            handle_bind(lfd, id, a, mem, &mut map)
+        } else if nr == libc::SYS_listen as i32 {
+            handle_listen(lfd, id, a, &mut map, &inbound_dir).await
+        } else if nr == libc::SYS_accept as i32 || nr == libc::SYS_accept4 as i32 {
+            handle_accept(lfd, id, a, &mut map, nr == libc::SYS_accept4 as i32).await
         } else if nr == libc::SYS_getsockname as i32 || nr == libc::SYS_getpeername as i32 {
             handle_sockname(lfd, id, a, mem, mem_writable, &mut map)
         } else {
@@ -2052,7 +2251,11 @@ fn handle_socket(lfd: RawFd, id: u64, a: [u64; 6], map: &mut HashMap<i32, Sock>)
         drop(theirs);
         map.insert(
             child_fd,
-            Sock::Stream(tokio::net::UnixStream::from_std(ours)?),
+            Sock::Stream {
+                pair: tokio::net::UnixStream::from_std(ours)?,
+                bound: None,
+                inbound: None,
+            },
         );
     } else {
         let (ours, theirs) = std::os::unix::net::UnixDatagram::pair()?;
@@ -2083,6 +2286,7 @@ async fn handle_connect(
     map: &mut HashMap<i32, Sock>,
     dns: &mut FakeDns,
     proxies: &[Proxy],
+    rules: &[Rule],
     verbose: bool,
 ) -> Result<()> {
     let fd = a[0] as i32;
@@ -2107,13 +2311,14 @@ async fn handle_connect(
         },
         IpAddr::V6(v6) => format!("[{v6}]:{port}"),
     };
+    let chain = select_chain(rules, proxies, &target);
     if verbose {
-        eprintln!("pod-netns: connect {target} via {}", proxies[0].endpoint());
+        eprintln!("pod-netns: connect {target} via {}", chain[0].endpoint());
     }
-    match connect_upstream_async(proxies, &target).await {
+    match connect_upstream_async(chain, &target).await {
         Ok(mut upstream) => {
             notif_respond(lfd, id, 0, 0)?;
-            if let Some(Sock::Stream(mut pair)) = map.remove(&fd) {
+            if let Some(Sock::Stream { pair: mut pair, .. }) = map.remove(&fd) {
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut pair, &mut upstream).await;
                 });
@@ -2366,6 +2571,115 @@ async fn relay_datagram(
     Ok(())
 }
 
+fn handle_bind(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    map: &mut HashMap<i32, Sock>,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    match map.get_mut(&fd) {
+        Some(Sock::Stream { bound, .. }) => {
+            if a[1] != 0 && a[2] >= 4 {
+                if let Some((_, ip, port)) =
+                    parse_sockaddr(&read_mem(mem, a[1], (a[2] as usize).min(128))?)
+                {
+                    *bound = Some((ip, port));
+                }
+            }
+            notif_respond(lfd, id, 0, 0)
+        }
+        // A datagram socket that binds a local port is a socketpair here.
+        Some(Sock::Datagram { .. }) => notif_respond(lfd, id, 0, 0),
+        None => notif_continue(lfd, id),
+    }
+}
+
+/// `listen` creates the real listener the sandbox can have: a unix socket named
+/// after the port. A reader task turns accepted connections into a queue that
+/// `accept` draws from.
+async fn handle_listen(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    map: &mut HashMap<i32, Sock>,
+    inbound_dir: &std::path::Path,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let Some(Sock::Stream {
+        bound: Some((_, port)),
+        ..
+    }) = map.get(&fd)
+    else {
+        return notif_continue(lfd, id);
+    };
+    let port = *port;
+    std::fs::create_dir_all(inbound_dir)?;
+    let path = inbound_dir.join(format!("{port}.sock"));
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path)
+        .with_context(|| format!("bind inbound listener {}", path.display()))?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((conn, _)) => {
+                    if tx.send(conn).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    if let Some(Sock::Stream { inbound, .. }) = map.get_mut(&fd) {
+        *inbound = Some(Inbound { rx, path });
+    }
+    notif_respond(lfd, id, 0, 0)
+}
+
+async fn handle_accept(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    map: &mut HashMap<i32, Sock>,
+    accept4: bool,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    // The caller's flags are on accept4 only; ADDFD takes just O_CLOEXEC.
+    let flags = if accept4 { a[3] as i32 } else { 0 };
+    let mut newfd_flags = 0u32;
+    if flags & libc::SOCK_CLOEXEC != 0 {
+        newfd_flags |= libc::O_CLOEXEC as u32;
+    }
+    let conn = {
+        let Some(Sock::Stream {
+            inbound: Some(inc), ..
+        }) = map.get_mut(&fd)
+        else {
+            return notif_continue(lfd, id);
+        };
+        match inc.rx.recv().await {
+            Some(c) => c,
+            None => return notif_respond(lfd, id, -1, libc::EINVAL),
+        }
+    };
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    set_nonblocking(ours.as_raw_fd())?;
+    if flags & libc::SOCK_NONBLOCK != 0 {
+        set_nonblocking(theirs.as_raw_fd())?;
+    }
+    let child_fd = notif_addfd_send(lfd, id, theirs.as_raw_fd(), newfd_flags)?;
+    drop(theirs);
+    let mut ours = tokio::net::UnixStream::from_std(ours)?;
+    let mut conn = conn;
+    tokio::spawn(async move {
+        let _ = tokio::io::copy_bidirectional(&mut ours, &mut conn).await;
+    });
+    Ok(())
+}
+
 fn handle_getsockopt(
     lfd: RawFd,
     id: u64,
@@ -2393,7 +2707,7 @@ fn handle_getsockopt(
     let mut val = vec![0u8; len];
     if level == libc::SOL_SOCKET && optname == libc::SO_TYPE {
         let ty = match entry {
-            Sock::Stream(_) => libc::SOCK_STREAM,
+            Sock::Stream { .. } => libc::SOCK_STREAM,
             Sock::Datagram { .. } => libc::SOCK_DGRAM,
         };
         let b = (ty as u32).to_ne_bytes();
@@ -2423,7 +2737,7 @@ fn handle_sockname(
     // Answer with a plausible INET address so a program that checks it does not
     // see an AF_UNIX socketpair.
     let (ip, port) = match entry {
-        Sock::Stream(_) => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Sock::Stream { bound, .. } => bound.unwrap_or((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
         Sock::Datagram { dest, .. } => dest.unwrap_or((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
     };
     let family = if ip.is_ipv4() {
