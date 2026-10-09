@@ -534,3 +534,121 @@ fn seccomp_backend_dials_the_tailnet_with_no_shim() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn pod_netns_serves_a_udp_front_door() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-udpfront-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        while let Ok((n, from)) = echo.recv_from(&mut buf) {
+            let mut reply = b"ECHO:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            let _ = echo.send_to(&reply, from);
+        }
+    });
+
+    // A UDP ASSOCIATE proxy for the front door to forward through.
+    let socks = dir.join("udp.sock");
+    let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let listener = UnixListener::bind(&socks).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let mut c = match conn {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let Some((cmd, _, _)) = read_request(&mut c) else {
+                continue;
+            };
+            if cmd != 3 {
+                continue;
+            }
+            let mut bnd = vec![5u8, 0, 0, 1];
+            bnd.extend_from_slice(
+                &relay_addr
+                    .ip()
+                    .to_string()
+                    .parse::<Ipv4Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            bnd.extend_from_slice(&relay_addr.port().to_be_bytes());
+            let _ = c.write_all(&bnd);
+            let mut buf = [0u8; 1];
+            while c.read(&mut buf).unwrap_or(0) == 1 {}
+        }
+    });
+    {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65535];
+            while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                if n < 4 {
+                    continue;
+                }
+                let off = match buf[3] {
+                    1 => 10,
+                    3 => 4 + 1 + buf[4] as usize + 2,
+                    4 => 22,
+                    _ => continue,
+                };
+                if n < off {
+                    continue;
+                }
+                let up = UdpSocket::bind("127.0.0.1:0").unwrap();
+                up.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let _ = up.send_to(&buf[off..n], echo_addr);
+                let mut reply = [0u8; 65535];
+                if let Ok((rn, _)) = up.recv_from(&mut reply) {
+                    let mut out = vec![0u8, 0, 0, 1, 127, 0, 0, 1];
+                    out.extend_from_slice(&echo_addr.port().to_be_bytes());
+                    out.extend_from_slice(&reply[..rn]);
+                    let _ = relay.send_to(&out, from);
+                }
+            }
+        });
+    }
+
+    let front = dir.join("front.sock");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--serve"])
+        .arg(format!("unix:{}", front.display()))
+        .args(["-x"])
+        .arg(format!("unix:{}", socks.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if front.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let program = build_program(&dir, "udp-client-front", UDP_CLIENT, false);
+    let output = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--backend", "seccomp", "-x"])
+        .arg(format!("unix:{}", front.display()))
+        .arg("--")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("UDP:9:ECHO:PING"),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

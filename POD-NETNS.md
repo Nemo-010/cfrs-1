@@ -205,9 +205,11 @@ pod-netns --serve unix:/run/front.sock -x unix:/run/upstream.sock &
 pod-netns --backend seccomp -x unix:/run/front.sock -- ./prog
 ```
 
-`--serve` reuses `cfrs::vnet::socks` for the request parsing and
-`cfrs::vnet::proxy::ProxyListen` for the listen spec, so the server side is the
-library's, not a second implementation.
+`--serve` handles `CONNECT`, HTTP `CONNECT` and `UDP ASSOCIATE`. The UDP case
+advertises a relay socket and forwards each datagram through the first upstream
+proxy's own association, so a UDP relay chains through an instance the same way
+a TCP one does. Request parsing reuses `cfrs::vnet::socks` and the listen spec
+`cfrs::vnet::proxy::ProxyListen`, so the server side is the library's.
 
 ### Remaining host limits
 

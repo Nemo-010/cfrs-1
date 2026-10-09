@@ -1834,45 +1834,194 @@ async fn serve_one(conn: Upstream, chain: &[Proxy], rules: &[Rule], verbose: boo
         let buf = reader.fill_buf().await?;
         buf.first().copied()
     };
-    let (request, is_socks5) = match first {
-        Some(5) => (socks::socks5_read_request(&mut reader).await?, true),
-        Some(_) => (socks::http_read_connect(&mut reader).await?, false),
-        None => return Ok(()),
-    };
-    let target = format!("{}:{}", request.host, request.port);
-    let selected = select_chain(rules, chain, &target);
-    if verbose {
-        eprintln!(
-            "pod-netns: front door {target} via {}",
-            selected[0].endpoint()
-        );
-    }
-    let mut upstream = match connect_upstream_async(selected, &target).await {
-        Ok(u) => u,
-        Err(e) => {
-            if is_socks5 {
-                let _ = socks::socks5_reply(
-                    &mut reader,
-                    socks::socks5_code_for_error(&e.to_string()),
-                    None,
-                )
-                .await;
-            } else {
-                let _ = socks::http_connect_reply(&mut reader, 502, "Bad Gateway").await;
+    match first {
+        Some(5) => {
+            let (cmd, request) = read_socks5_command(&mut reader).await?;
+            if cmd == 0x03 {
+                return serve_udp_associate(reader, chain, verbose).await;
             }
-            return Err(e);
+            let target = format!("{}:{}", request.host, request.port);
+            let selected = select_chain(rules, chain, &target);
+            if verbose {
+                eprintln!(
+                    "pod-netns: front door {target} via {}",
+                    selected[0].endpoint()
+                );
+            }
+            let mut upstream = match connect_upstream_async(selected, &target).await {
+                Ok(u) => u,
+                Err(e) => {
+                    let _ = socks::socks5_reply(
+                        &mut reader,
+                        socks::socks5_code_for_error(&e.to_string()),
+                        None,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
+            socks::socks5_reply(&mut reader, 0x00, None).await?;
+            let _ = tokio::io::copy_bidirectional(&mut reader, &mut upstream).await;
+            Ok(())
         }
-    };
-    if is_socks5 {
-        socks::socks5_reply(&mut reader, 0x00, None).await?;
-    } else {
-        socks::http_connect_ok(&mut reader).await?;
+        Some(_) => {
+            let request = socks::http_read_connect(&mut reader).await?;
+            let target = format!("{}:{}", request.host, request.port);
+            let selected = select_chain(rules, chain, &target);
+            let mut upstream = match connect_upstream_async(selected, &target).await {
+                Ok(u) => u,
+                Err(e) => {
+                    let _ = socks::http_connect_reply(&mut reader, 502, "Bad Gateway").await;
+                    return Err(e);
+                }
+            };
+            socks::http_connect_ok(&mut reader).await?;
+            let _ = tokio::io::copy_bidirectional(&mut reader, &mut upstream).await;
+            Ok(())
+        }
+        None => Ok(()),
     }
-    let _ = tokio::io::copy_bidirectional(&mut reader, &mut upstream).await;
+}
+
+/// Read a SOCKS5 greeting and request, accepting any command so
+/// `UDP ASSOCIATE` is not rejected before it can be served.
+async fn read_socks5_command<S>(stream: &mut S) -> Result<(u8, cfrs::vnet::socks::ProxyRequest)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use cfrs::vnet::socks::ProxyHost;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut intro = [0u8; 2];
+    stream
+        .read_exact(&mut intro)
+        .await
+        .context("SOCKS5 greeting")?;
+    if intro[0] != 0x05 {
+        bail!("SOCKS5 version {} is not 5", intro[0]);
+    }
+    let mut methods = vec![0u8; intro[1] as usize];
+    stream.read_exact(&mut methods).await?;
+    stream.write_all(&[0x05, 0x00]).await?;
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("SOCKS5 request")?;
+    if header[0] != 0x05 {
+        bail!("SOCKS5 request version {} is not 5", header[0]);
+    }
+    let host = match header[3] {
+        0x01 => {
+            let mut a = [0u8; 4];
+            stream.read_exact(&mut a).await?;
+            ProxyHost::Ip(IpAddr::V4(Ipv4Addr::from(a)))
+        }
+        0x03 => {
+            let mut l = [0u8; 1];
+            stream.read_exact(&mut l).await?;
+            let mut h = vec![0u8; l[0] as usize];
+            stream.read_exact(&mut h).await?;
+            ProxyHost::Domain(String::from_utf8_lossy(&h).to_string())
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            stream.read_exact(&mut a).await?;
+            ProxyHost::Ip(IpAddr::V6(std::net::Ipv6Addr::from(a)))
+        }
+        other => bail!("SOCKS5 address type {other} is not supported"),
+    };
+    let mut p = [0u8; 2];
+    stream.read_exact(&mut p).await?;
+    Ok((
+        header[1],
+        cfrs::vnet::socks::ProxyRequest {
+            host,
+            port: u16::from_be_bytes(p),
+        },
+    ))
+}
+
+/// Answer `UDP ASSOCIATE` by relaying through the first upstream proxy's own
+/// association, so a UDP relay can chain through this instance.
+async fn serve_udp_associate(
+    mut control: tokio::io::BufReader<Upstream>,
+    chain: &[Proxy],
+    verbose: bool,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy = chain.first().context("no upstream for UDP ASSOCIATE")?;
+    if proxy.kind != ProxyKind::Socks5 {
+        let _ = control
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        bail!("UDP ASSOCIATE needs a SOCKS5 upstream");
+    }
+    // Our own relay socket, advertised to the client.
+    let relay = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+    let addr = relay.local_addr()?;
+    let mut bnd = vec![0x05u8, 0x00, 0x00];
+    match addr {
+        SocketAddr::V4(a) => {
+            bnd.push(0x01);
+            bnd.extend_from_slice(&a.ip().octets());
+            bnd.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            bnd.push(0x04);
+            bnd.extend_from_slice(&a.ip().octets());
+            bnd.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+    control.write_all(&bnd).await?;
+    control.flush().await?;
+
+    // The upstream's relay, reached over its own association.
+    let up_control = dial_proxy(proxy).await?;
+    let (_up_control, up_addr) = socks5_udp_associate(up_control, proxy).await?;
+    let up = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+    if verbose {
+        eprintln!("pod-netns: front door UDP relay {addr} -> {up_addr}");
+    }
+
+    let client: Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // client -> upstream
+    {
+        let relay = relay.clone();
+        let up = up.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, from)) = relay.recv_from(&mut buf).await {
+                *client.lock().await = Some(from);
+                if n < 4 {
+                    continue;
+                }
+                let _ = up.send_to(&buf[..n], up_addr).await;
+            }
+        });
+    }
+    // upstream -> client
+    {
+        let relay = relay.clone();
+        let up = up.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, _)) = up.recv_from(&mut buf).await {
+                if let Some(to) = *client.lock().await {
+                    let _ = relay.send_to(&buf[..n], to).await;
+                }
+            }
+        });
+    }
+    // Hold the control connection until the client closes it.
+    let mut byte = [0u8; 1];
+    while control.read(&mut byte).await.unwrap_or(0) == 1 {}
     Ok(())
 }
 
-// ── seccomp user-notification backend ───────────────────────────────────────
+// ── seccomp user-notification backend ─// ── seccomp user-notification backend ───────────────────────────────────────
 //
 // Where a network namespace is denied, a seccomp filter that returns
 // `SECCOMP_RET_USER_NOTIF` still lets a supervisor mediate syscalls without any
