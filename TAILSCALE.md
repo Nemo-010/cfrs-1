@@ -217,3 +217,100 @@ The daemon and the release tarball are the same stock binaries recorded above.
 The only things added are scripts the daemon itself invokes and an
 `LD_PRELOAD` library for the client; Tailscale is not patched, recompiled or
 re-linked.
+
+## A real shell: no `/dev/ptmx`, so the pty is userspace
+
+The SSH server above is the way into a sealed host, but it cannot run an
+interactive shell. The daemon that serves it is static Go, so its
+`pty.Open()` cannot be interposed, and there is no kernel pty to give it:
+
+| probe | result |
+|---|---|
+| `posix_openpt(O_RDWR)` | `ENOENT` (`/dev/ptmx` absent) |
+| write a node in `/dev` | `EACCES` |
+| `mknod /dev/ptmx c 5 2` | `EPERM` (no `CAP_MKNOD`) |
+| `pty.openpty()` in Python | `OSError: out of pty devices` |
+
+When the client asks for a pty, Tailscale's server calls `startWithPTY` and
+returns its error: it *fails* the session. OpenSSH's `sshd` does the opposite —
+it logs `openpty: No such file or directory`, refuses the pty and **carries on
+over pipes** — which is the seam everything else hangs from.
+
+### The shape
+
+```
+client ──tailnet──► tailscaled ──serve --tcp──► unix:/run/sshd.sock
+                                                      │
+                                              shim/unixsockd.c
+                                                      │ accept, fork
+                                              sshd -i  (dynamic, fakepwd)
+                                                      │ refuses pty, pipes
+                                              loginshell = faketty errandsh
+                                                      │ fakepty.so
+                                              a userspace terminal
+```
+
+- **`tailscale serve --tcp 2222 unix:/run/sshd.sock`** is stock Tailscale. It
+  accepts on the tailnet and dials the daemon's own netstack to a unix socket,
+  which the host permits.
+- **`shim/unixsockd.c`** is the listener OpenSSH lacks: OpenSSH will not bind a
+  unix socket, so this accepts and hands each connection to `sshd -i` on
+  stdin/stdout. stderr goes to a log file, not the connection, or `sshd -e`
+  corrupts the stream (`Bad packet length`).
+- **`sshd` is dynamic**, so `fakepwd.so` resolves the login and `loginshell`
+  runs. It is the same `fakepwd` the rest of this document uses; the daemon
+  itself is still untouched.
+- **`loginshell`** exports `SANDHOME_FAKEPTY` and execs `faketty errandsh`.
+  `fakepty.so` is a userspace pty: it interposes `isatty`, `tcgetattr`,
+  `tcsetattr` and the window-size `ioctl` for the session's own descriptors,
+  and maps `/dev/tty` onto them. `errandsh` is sandhome's POSIX-sh line
+  discipline: echo, a prompt with the last exit code, history, editing, tab
+  completion and full-screen programs.
+
+`tools/ts-sshd.sh` assembles all of it, fetching errandsh/faketty/fakepty from
+sandhome at a pinned commit with sha256 checks:
+
+```sh
+cfrs net ts-shims --out /run/cfrs-ts-shims --user nemo
+tools/ts-sshd.sh --shims /run/cfrs-ts-shims --port 2222 --serve
+# put your public key in /run/cfrs-ts-shims/sshd/authorized_keys, then:
+ssh -p 2222 root@<this-node>
+```
+
+### Two gates worth naming
+
+- **`serve` for a unix socket needs root or a local admin.** `authorizeServeConfigForGOOSAndUserContext`
+  calls `connIsLocalAdmin`, which for a non-root operator runs
+  `sudo --other-user=<name> --list tailscale`; with no sudo and no `/etc/group`
+  that fails. `shim/sudo` answers that one probe, and `tailscale set
+  --operator=<daemon uid>` makes the daemon's own uid the operator. No
+  privilege is assumed; the daemon runs as the same unprivileged user it
+  already did.
+- **The client must not force a pty.** With `RequestTTY auto` (the default when
+  stdin is a terminal) OpenSSH warns `PTY allocation request failed` and
+  continues; `force` (`ssh -tt`) treats the refusal as fatal. So the working
+  client is plain `ssh -p 2222`, or `-T` for a non-interactive command.
+
+### What is proven
+
+With a dynamic `/usr/sbin/sshd`, the generated shims, and `tailscale serve
+--tcp 2222 unix:/run/sshd.sock`:
+
+- `ssh -p 2222 root@100.119.211.25 -- 'echo FINAL_OK; id; tty; echo TERM=$TERM'`
+  returns `FINAL_OK`, `uid=966 gid=965 groups=965`, `/dev/tty`, and
+  `TERM=xterm-256color`.
+- Piping commands to an interactive session runs them through the errandsh
+  prompt and returns their output, which shows the line discipline is live.
+- `sshd -e` logs `Accepted publickey for root` and
+  `session_pty_req: session 0 alloc failed` — the refusal is real, and the
+  session continues anyway.
+
+### Limits
+
+- **`ssh -tt` aborts.** The server cannot allocate a pty, so a client that
+  insists on one is refused. Use the default (`auto`) or `-T`.
+- **The pty is userspace.** A statically linked full-screen program cannot be
+  interposed and will not see a terminal; dynamic ones work.
+- **Key auth is required.** This is a second SSH server; it does not inherit
+  Tailscale's identity authentication. The client's public key goes in
+  `authorized_keys`.

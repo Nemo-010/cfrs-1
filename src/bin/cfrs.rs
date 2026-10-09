@@ -118,6 +118,8 @@ net ts-shims OPTIONS:
         --user NAME              Local login name [default: $USER]
         --uid N                  Local uid [default: the current one]
         --gid N                  Local gid [default: the current one]
+        --shell PATH             Login shell for the synthetic user
+                                  [default: /bin/sh]
         --json                   Print the client environment as JSON
 
 EXAMPLES:
@@ -605,7 +607,7 @@ const NET_FLAGS: &[&str] = &["out", "log", "map-loopback", "json"];
 const NET_PROXY_FLAGS: &[&str] = &["listen", "map", "forward", "port", "run-for"];
 const NET_TAILSCALE_FLAGS: &[&str] = &["socket", "listen", "port", "run-for"];
 const NET_SOCKSIFY_FLAGS: &[&str] = &["out", "proxy", "log", "json"];
-const NET_TS_SHIMS_FLAGS: &[&str] = &["out", "user", "uid", "gid", "json"];
+const NET_TS_SHIMS_FLAGS: &[&str] = &["out", "user", "uid", "gid", "shell", "json"];
 
 fn cmd_net(args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
@@ -898,6 +900,9 @@ fn cmd_net_ts_shims(args: &[String]) -> Result<(), String> {
     }
     if let Some(gid) = flags.get("gid") {
         user.gid = gid.parse().map_err(|_| "--gid expects a number".to_string())?;
+    }
+    if let Some(shell) = flags.get("shell") {
+        user.shell = shell.to_string();
     }
 
     let shims = tailscale_ssh::install(&directory, &[user.clone()])

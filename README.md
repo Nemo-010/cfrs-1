@@ -153,6 +153,13 @@ PATH=/run/cfrs-ts-shims:$PATH tailscaled --tun=userspace-networking \
     --statedir /run/cfrs-ts-shims --socket /run/tailscale/tailscaled.sock
 ```
 
+An interactive *shell* needs one more step. The daemon is static Go, so it
+cannot be given a userspace pty, and a pty request fails the session; a dynamic
+`sshd` refuses the pty and carries on. `tools/ts-sshd.sh` runs one on a unix
+socket, exposes it with `tailscale serve --tcp`, and gives the login shell
+sandhome's `fakepty` and `errandsh`, so a pty-less session still has echo, a
+prompt and line editing.
+
 The measurements that force this shape, what is proven live, and the limits
 (no UDP, names through `getaddrinfo`, `Dial-Self`) are in
 [`TAILSCALE.md`](./TAILSCALE.md).
