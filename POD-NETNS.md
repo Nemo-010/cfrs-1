@@ -63,10 +63,55 @@ ptrace are denied, `SECCOMP_RET_USER_NOTIF` can still intercept
 `socket`/`connect` and hand the child a proxied descriptor with
 `SECCOMP_IOCTL_NOTIF_ADDFD`. That is the planned second backend.
 
+## The seccomp backend (works where namespaces are denied)
+
+Where `unshare` and `/dev/net/tun` are unavailable — as in the sandbox above —
+the kernel still offers `SECCOMP_RET_USER_NOTIF`. This backend intercepts
+syscalls with no `LD_PRELOAD`, so a static binary is covered like any other.
+
+```sh
+pod-netns --backend seccomp -x unix:/run/socks.sock -- ./program
+```
+
+**How it works**
+
+- A seccomp filter returns `SECCOMP_RET_USER_NOTIF` for `socket`, `connect`,
+  `sendto`, `sendmsg`, `sendmmsg`, `bind`, `setsockopt`, `getsockopt`,
+  `getsockname` and `getpeername`.
+- On `socket(AF_INET, SOCK_STREAM)`, the supervisor creates a **socketpair**
+  and installs one end in the child with `SECCOMP_IOCTL_NOTIF_ADDFD`. The child
+  gets a real, connected descriptor, so `read`/`write`/`poll`/`epoll`/`close`
+  all work natively — only `connect` needs answering.
+- On `connect`, the supervisor reads the `sockaddr` from the child with
+  `/proc/<pid>/mem`, dials the upstream proxy, replies `0`, and splices the
+  socketpair with `copy_bidirectional`.
+- UDP port 53 is answered from the fake-IP pool, so the proxy receives the
+  **name**. glibc's resolver calls `setsockopt` before it sends; an `AF_UNIX`
+  socketpair rejects that, so the supervisor answers it, or the resolver gives
+  up before any packet exists.
+- The child must be **blocking** unless it asked for `SOCK_NONBLOCK`: a tokio
+  `pair()` is non-blocking on both ends, and `ADDFD`'s `newfd_flags` accepts
+  only `O_CLOEXEC` on older kernels, so the flag is set on the shared
+  description instead.
+
+**Getting the listener fd to the supervisor without deadlock.** The filter must
+be installed before the child passes the fd, but the only `SCM_RIGHTS` call is
+`sendmsg`, which the filter intercepts — a self-deadlock. `/proc/<pid>/fd` is
+refused for a seccomp listener, and `pidfd_getfd` needs ptrace. The answer is
+that a filter is **per-thread** unless `TSYNC` is used: a helper thread installs
+the filter and forks there, so the child inherits it while the fd stays in the
+process's own fd table. No handshake is needed at all.
+
+**Proven** (integration test `tests/pod_netns_seccomp.rs`): a SOCKS5 proxy on a
+unix socket, and a C client built **both dynamically and statically**; each
+reaches the proxy, and `getaddrinfo("example.com")` resolves to a `198.18.x.x`
+fake IP with the proxy seeing `example.com:80`, not the address.
+
 ## Status
 
-The netns backend is implemented and builds; it needs a host that permits user
-namespaces and has `/dev/net/tun`, neither of which this development sandbox
-has (measured above). The seccomp backend is not implemented yet. Unit tests
-cover the pure parts: proxy-spec parsing, fake-IP stability and reversibility,
-base64 for `Proxy-Authorization`, target splitting, and the SYN parser.
+The netns backend needs a host that permits user namespaces and has
+`/dev/net/tun`. The seccomp backend needs neither and runs in the sealed sandbox
+(measured above); it is the default when the netns probes fail. Unit tests cover
+the pure parts (proxy-spec parsing, fake-IP stability, base64, target splitting,
+the SYN parser) and `tests/pod_netns_seccomp.rs` covers the whole path for both
+binary kinds.

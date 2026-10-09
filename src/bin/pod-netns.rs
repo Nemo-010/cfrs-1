@@ -79,10 +79,31 @@ struct Proxy {
     port: u16,
     user: Option<String>,
     pass: Option<String>,
+    /// When set, the proxy is reached over an `AF_UNIX` socket instead of TCP.
+    /// A sealed host may permit unix connects and deny every TCP one.
+    unix_path: Option<String>,
 }
 
 impl Proxy {
     fn parse(spec: &str) -> Result<Self> {
+        // unix:/path or socks5+unix:/path — a SOCKS5 proxy on a unix socket.
+        if let Some(path) = spec
+            .strip_prefix("unix:")
+            .or_else(|| spec.strip_prefix("socks5+unix:"))
+            .or_else(|| spec.strip_prefix("socks5+unix://"))
+        {
+            if path.is_empty() {
+                bail!("unix proxy {spec:?} has no path");
+            }
+            return Ok(Self {
+                kind: ProxyKind::Socks5,
+                host: String::new(),
+                port: 0,
+                user: None,
+                pass: None,
+                unix_path: Some(path.to_string()),
+            });
+        }
         let (scheme, rest) = match spec.split_once("://") {
             Some((s, r)) => (s, r),
             None => ("socks5", spec),
@@ -113,21 +134,33 @@ impl Proxy {
             port: port.parse().context("proxy port")?,
             user,
             pass,
+            unix_path: None,
         })
     }
 
     fn endpoint(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        match &self.unix_path {
+            Some(p) => format!("unix:{p}"),
+            None => format!("{}:{}", self.host, self.port),
+        }
     }
 }
 
 // ── command line ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Auto,
+    Netns,
+    Seccomp,
+}
 
 struct Args {
     proxies: Vec<Proxy>,
     program: Vec<String>,
     doctor: bool,
     verbose: bool,
+    backend: BackendKind,
 }
 
 fn usage() -> String {
@@ -155,6 +188,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     let mut program = Vec::new();
     let mut doctor = false;
     let mut verbose = false;
+    let mut backend = BackendKind::Auto;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -179,13 +213,29 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 proxies.push(Proxy::parse(spec)?);
                 i += 2;
             }
+            "--backend" => {
+                let value = argv.get(i + 1).context("--backend needs a value")?;
+                backend = match value.as_str() {
+                    "auto" => BackendKind::Auto,
+                    "netns" => BackendKind::Netns,
+                    "seccomp" => BackendKind::Seccomp,
+                    other => bail!("unknown backend {other:?} (auto, netns, seccomp)"),
+                };
+                i += 2;
+            }
             other => bail!("unexpected argument {other:?}; see --help"),
         }
     }
     if !doctor && program.is_empty() {
         bail!("nothing to run; usage: pod-netns [OPTIONS] -- PROGRAM");
     }
-    Ok(Args { proxies, program, doctor, verbose })
+    Ok(Args {
+        proxies,
+        program,
+        doctor,
+        verbose,
+        backend,
+    })
 }
 
 // ── capability probes ───────────────────────────────────────────────────────
@@ -211,13 +261,29 @@ fn probe_unshare(flags: libc::c_int) -> Probe {
     }
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
-    let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
-    let name = if flags == libc::CLONE_NEWNET { "unshare(CLONE_NEWNET)" } else { "unshare(NEWUSER|NEWNET)" };
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    };
+    let name = if flags == libc::CLONE_NEWNET {
+        "unshare(CLONE_NEWNET)"
+    } else {
+        "unshare(NEWUSER|NEWNET)"
+    };
     if code == 0 {
-        Probe { name, ok: true, detail: "ok".into() }
+        Probe {
+            name,
+            ok: true,
+            detail: "ok".into(),
+        }
     } else {
         let errno = std::io::Error::from_raw_os_error(code);
-        Probe { name, ok: false, detail: format!("{errno}") }
+        Probe {
+            name,
+            ok: false,
+            detail: format!("{errno}"),
+        }
     }
 }
 
@@ -226,10 +292,18 @@ fn probe_tun() -> Probe {
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         let e = std::io::Error::last_os_error();
-        return Probe { name: "open(/dev/net/tun)", ok: false, detail: format!("{e}") };
+        return Probe {
+            name: "open(/dev/net/tun)",
+            ok: false,
+            detail: format!("{e}"),
+        };
     }
     unsafe { libc::close(fd) };
-    Probe { name: "open(/dev/net/tun)", ok: true, detail: "ok".into() }
+    Probe {
+        name: "open(/dev/net/tun)",
+        ok: true,
+        detail: "ok".into(),
+    }
 }
 
 fn probe_ptrace() -> Probe {
@@ -257,7 +331,11 @@ fn probe_ptrace() -> Probe {
         libc::kill(pid, libc::SIGKILL);
         libc::waitpid(pid, &mut status, 0);
     }
-    Probe { name: "PTRACE_TRACEME (fallback backend)", ok: stopped, detail }
+    Probe {
+        name: "PTRACE_TRACEME (fallback backend)",
+        ok: stopped,
+        detail,
+    }
 }
 
 /// Can a seccomp filter that returns `SECCOMP_RET_USER_NOTIF` be installed and
@@ -270,20 +348,38 @@ fn probe_seccomp_notif() -> Probe {
     const RET_USER_NOTIF: u32 = 0x7fc0_0000;
     const RET_ALLOW: u32 = 0x7fff_0000;
     const SET_MODE_FILTER: libc::c_uint = 1;
-    const FLAG_NEW_LISTENER: libc::c_uint = 1;
+    const FLAG_NEW_LISTENER: libc::c_uint = 8;
 
     let filter = [
-        libc::sock_filter { code: BPF_LD_ABS_W, jt: 0, jf: 0, k: 0 },
+        libc::sock_filter {
+            code: BPF_LD_ABS_W,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
         libc::sock_filter {
             code: BPF_JEQ_K,
             jt: 0,
             jf: 1,
             k: libc::SYS_getpid as u32,
         },
-        libc::sock_filter { code: BPF_RET_K, jt: 0, jf: 0, k: RET_USER_NOTIF },
-        libc::sock_filter { code: BPF_RET_K, jt: 0, jf: 0, k: RET_ALLOW },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: RET_USER_NOTIF,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: RET_ALLOW,
+        },
     ];
-    let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut _,
+    };
     let r = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
@@ -301,7 +397,11 @@ fn probe_seccomp_notif() -> Probe {
     }
     let fd = r as RawFd;
     unsafe { libc::close(fd) };
-    Probe { name: "seccomp(SECCOMP_RET_USER_NOTIF)", ok: true, detail: "listener installed".into() }
+    Probe {
+        name: "seccomp(SECCOMP_RET_USER_NOTIF)",
+        ok: true,
+        detail: "listener installed".into(),
+    }
 }
 
 fn doctor() -> i32 {
@@ -314,7 +414,12 @@ fn doctor() -> i32 {
     ];
     println!("pod-netns: capability report");
     for p in &probes {
-        println!("  {:<34} {:<5} {}", p.name, if p.ok { "ok" } else { "no" }, p.detail);
+        println!(
+            "  {:<34} {:<5} {}",
+            p.name,
+            if p.ok { "ok" } else { "no" },
+            p.detail
+        );
     }
     // The netns backend needs a network namespace and a TUN device.
     let netns_ok = probes[0].ok || probes[1].ok;
@@ -327,7 +432,9 @@ fn doctor() -> i32 {
         println!("pod-netns: note: descendant ptrace works, so a ptrace backend could run here");
     }
     if probes[4].ok {
-        println!("pod-netns: note: SECCOMP_RET_USER_NOTIF works, so a seccomp backend could run here");
+        println!(
+            "pod-netns: note: SECCOMP_RET_USER_NOTIF works, so a seccomp backend could run here"
+        );
     }
     EXIT_NO_BACKEND
 }
@@ -339,7 +446,8 @@ fn write_proc(path: &str, data: &str) -> Result<()> {
         .write(true)
         .open(path)
         .with_context(|| format!("open {path}"))?;
-    f.write_all(data.as_bytes()).with_context(|| format!("write {path}"))
+    f.write_all(data.as_bytes())
+        .with_context(|| format!("write {path}"))
 }
 
 fn write_id_maps(pid: u32) -> Result<()> {
@@ -390,7 +498,11 @@ fn create_tun(name: &str) -> Result<OwnedFd> {
     let mut ifr = ifreq_for(name);
     let r = unsafe {
         ifr.ifr_ifru.ifru_flags = (IFF_TUN | IFF_NO_PI) as libc::c_short;
-        libc::ioctl(owned.as_raw_fd(), TUNSETIFF as _, &mut ifr as *mut libc::ifreq)
+        libc::ioctl(
+            owned.as_raw_fd(),
+            TUNSETIFF as _,
+            &mut ifr as *mut libc::ifreq,
+        )
     };
     if r < 0 {
         return Err(std::io::Error::last_os_error()).context("ioctl TUNSETIFF");
@@ -400,14 +512,16 @@ fn create_tun(name: &str) -> Result<OwnedFd> {
     // namespace even when the ioctls succeed.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock < 0 {
-        bail!("socket() for tun config: {}", std::io::Error::last_os_error());
+        bail!(
+            "socket() for tun config: {}",
+            std::io::Error::last_os_error()
+        );
     }
     let guard = FdGuard(sock);
     let set_addr = |cmd: libc::c_ulong, addr: Ipv4Addr| -> Result<()> {
         let mut ifr = ifreq_for(name);
         let r = unsafe {
-            let sin =
-                &mut ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
+            let sin = &mut ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
             (*sin).sin_family = libc::AF_INET as u16;
             (*sin).sin_addr.s_addr = u32::from_ne_bytes(addr.octets());
             libc::ioctl(guard.0, cmd as _, &ifr as *const _)
@@ -470,7 +584,11 @@ impl Drop for FdGuard {
 
 /// Send one fd over a unix socketpair with SCM_RIGHTS.
 fn send_fd(sock: RawFd, fd: RawFd) -> Result<()> {
-    let mut iov = libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut _,
+        iov_len: 1,
+    };
     let mut cmsg = [0u8; 64];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -517,7 +635,10 @@ fn CMSG_LEN(len: u32) -> u32 {
 /// Receive one fd over a unix socketpair.
 fn recv_fd(sock: RawFd) -> Result<RawFd> {
     let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut _, iov_len: 1 };
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut _,
+        iov_len: 1,
+    };
     let mut cmsg = [0u8; 64];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -556,7 +677,12 @@ impl Tun {
     fn new(fd: RawFd, mtu: usize) -> Self {
         // The read loop drains until EAGAIN, so the fd must not block.
         unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
-        Self { fd, mtu, rx: VecDeque::new(), tx: VecDeque::new() }
+        Self {
+            fd,
+            mtu,
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
+        }
     }
 
     /// Read whatever the kernel has queued into `rx`.
@@ -635,7 +761,11 @@ struct FakeDns {
 
 impl FakeDns {
     fn new() -> Self {
-        Self { by_ip: HashMap::new(), by_name: HashMap::new(), next: 0 }
+        Self {
+            by_ip: HashMap::new(),
+            by_name: HashMap::new(),
+            next: 0,
+        }
     }
 
     fn address_for(&mut self, name: &str) -> Ipv4Addr {
@@ -684,9 +814,14 @@ impl Backend {
         config.random_seed = seed();
         let mut interface = Interface::new(config, &mut device, SmolInstant::now());
         interface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(IpAddress::Ipv4(smol_v4(TUN_GW)), TUN_PREFIX)).unwrap();
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv4(smol_v4(TUN_GW)), TUN_PREFIX))
+                .unwrap();
         });
-        interface.routes_mut().add_default_ipv4_route(smol_v4(TUN_GW)).unwrap();
+        interface
+            .routes_mut()
+            .add_default_ipv4_route(smol_v4(TUN_GW))
+            .unwrap();
         // Accept packets addressed to any destination: the guest connects to
         // real addresses, and we impersonate all of them.
         interface.set_any_ip(true);
@@ -733,7 +868,8 @@ impl Backend {
     async fn tick(&mut self) -> Result<()> {
         self.observe_syns();
         self.answer_dns();
-        self.interface.poll(SmolInstant::now(), &mut self.device, &mut self.sockets);
+        self.interface
+            .poll(SmolInstant::now(), &mut self.device, &mut self.sockets);
         self.accept_flows().await;
         self.shuttle().await;
         self.device.flush();
@@ -743,8 +879,12 @@ impl Backend {
     fn answer_dns(&mut self) {
         let socket = self.sockets.get_mut::<udp::Socket>(self.dns_socket);
         while socket.can_recv() {
-            let Ok((data, meta)) = socket.recv() else { break };
-            let Ok(query) = cfrs::vnet::dns::ParsedQuery::parse(data) else { continue };
+            let Ok((data, meta)) = socket.recv() else {
+                break;
+            };
+            let Ok(query) = cfrs::vnet::dns::ParsedQuery::parse(data) else {
+                continue;
+            };
             let ip = self.dns.address_for(&query.name);
             let answers = vec![IpAddr::V4(ip)];
             let reply = cfrs::vnet::dns::build_response(&query, &answers, 0);
@@ -766,8 +906,12 @@ impl Backend {
                 if !matches!(socket.state(), tcp::State::Established) {
                     continue;
                 }
-                let Some(local) = socket.local_endpoint() else { continue };
-                let IpAddress::Ipv4(dst_ip) = local.addr else { continue };
+                let Some(local) = socket.local_endpoint() else {
+                    continue;
+                };
+                let IpAddress::Ipv4(dst_ip) = local.addr else {
+                    continue;
+                };
                 let b = dst_ip.as_bytes();
                 let dst_ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
                 match self.dns.name_for(dst_ip) {
@@ -781,12 +925,15 @@ impl Backend {
             }
             match connect_upstream(&proxy, &target).await {
                 Ok(stream) => {
-                    self.flows.insert(handle, Flow {
-                        upstream: stream,
-                        to_upstream: Vec::new(),
-                        to_app: Vec::new(),
-                        up_eof: false,
-                    });
+                    self.flows.insert(
+                        handle,
+                        Flow {
+                            upstream: stream,
+                            to_upstream: Vec::new(),
+                            to_app: Vec::new(),
+                            up_eof: false,
+                        },
+                    );
                 }
                 Err(e) => {
                     if self.verbose {
@@ -923,13 +1070,42 @@ async fn connect_upstream(proxy: &Proxy, target: &str) -> Result<tokio::net::Tcp
     }
 }
 
-async fn socks5_connect(
-    mut stream: tokio::net::TcpStream,
-    proxy: &Proxy,
-    target: &str,
-) -> Result<tokio::net::TcpStream> {
+/// A connected upstream: TCP, or a unix socket where TCP is denied.
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub type Upstream = Box<dyn AsyncStream>;
+
+/// Dial the proxy, over TCP or a unix socket, and run its handshake. The
+/// result is a stream carrying the target's bytes, whatever the transport.
+async fn connect_upstream_async(proxy: &Proxy, target: &str) -> Result<Upstream> {
+    let stream: Upstream = match &proxy.unix_path {
+        Some(path) => Box::new(
+            tokio::net::UnixStream::connect(path)
+                .await
+                .with_context(|| format!("connect to unix proxy {path}"))?,
+        ),
+        None => Box::new(
+            tokio::net::TcpStream::connect(proxy.endpoint())
+                .await
+                .with_context(|| format!("connect to proxy {}", proxy.endpoint()))?,
+        ),
+    };
+    match proxy.kind {
+        ProxyKind::Socks5 => socks5_connect(stream, proxy, target).await,
+        ProxyKind::Http => http_connect(stream, proxy, target).await,
+    }
+}
+
+async fn socks5_connect<S>(mut stream: S, proxy: &Proxy, target: &str) -> Result<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let methods: &[u8] = if proxy.user.is_some() { &[0x00, 0x02] } else { &[0x00] };
+    let methods: &[u8] = if proxy.user.is_some() {
+        &[0x00, 0x02]
+    } else {
+        &[0x00]
+    };
     stream.write_all(&[0x05, methods.len() as u8]).await?;
     stream.write_all(methods).await?;
     let mut resp = [0u8; 2];
@@ -988,11 +1164,10 @@ async fn socks5_connect(
     Ok(stream)
 }
 
-async fn http_connect(
-    mut stream: tokio::net::TcpStream,
-    proxy: &Proxy,
-    target: &str,
-) -> Result<tokio::net::TcpStream> {
+async fn http_connect<S>(mut stream: S, proxy: &Proxy, target: &str) -> Result<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
     if let (Some(u), Some(p)) = (&proxy.user, &proxy.pass) {
@@ -1014,9 +1189,15 @@ async fn http_connect(
         }
     }
     let text = String::from_utf8_lossy(&buf);
-    let status = text.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok());
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
     if status != Some(200) {
-        bail!("proxy CONNECT to {target} failed: {}", text.lines().next().unwrap_or(""));
+        bail!(
+            "proxy CONNECT to {target} failed: {}",
+            text.lines().next().unwrap_or("")
+        );
     }
     Ok(stream)
 }
@@ -1032,12 +1213,24 @@ fn base64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1076,7 +1269,9 @@ fn run(args: Args) -> Result<i32> {
     let tun_fd = recv_fd(parent).context("receive TUN fd")?;
     unsafe { libc::close(parent) };
 
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let proxies = args.proxies.clone();
     let verbose = args.verbose;
     let result = runtime.block_on(async move {
@@ -1143,7 +1338,11 @@ fn child_setup(sock: RawFd, args: &Args) -> Result<()> {
     for a in program {
         argv.push(CString::new(a.as_bytes())?);
     }
-    let ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    let ptrs: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
     unsafe {
         libc::execvp(path.as_ptr(), ptrs.as_ptr());
     }
@@ -1178,7 +1377,15 @@ fn read_exact_fd(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
 
 fn socketpair() -> Result<(RawFd, RawFd)> {
     let mut fds = [0 as RawFd; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
         bail!("socketpair: {}", std::io::Error::last_os_error());
     }
     Ok((fds[0], fds[1]))
@@ -1229,7 +1436,10 @@ mod tests {
 
     #[test]
     fn split_target_keeps_ipv4_and_names() {
-        assert_eq!(split_target("example.com:443").unwrap(), ("example.com".into(), 443));
+        assert_eq!(
+            split_target("example.com:443").unwrap(),
+            ("example.com".into(), 443)
+        );
         assert_eq!(split_target("1.2.3.4:80").unwrap(), ("1.2.3.4".into(), 80));
         assert!(split_target("noport").is_err());
     }
@@ -1246,7 +1456,12 @@ mod tests {
         pkt[33] = 0x02; // SYN
         assert_eq!(
             parse_tcp_syn(&pkt),
-            Some((Ipv4Addr::new(10, 0, 0, 2), 40000, Ipv4Addr::new(93, 184, 216, 34), 443))
+            Some((
+                Ipv4Addr::new(10, 0, 0, 2),
+                40000,
+                Ipv4Addr::new(93, 184, 216, 34),
+                443
+            ))
         );
 
         // An ACK is not a SYN.
@@ -1261,6 +1476,750 @@ mod tests {
     }
 }
 
+// ── seccomp user-notification backend ───────────────────────────────────────
+//
+// Where a network namespace is denied, a seccomp filter that returns
+// `SECCOMP_RET_USER_NOTIF` still lets a supervisor mediate syscalls without any
+// `LD_PRELOAD`. This backend intercepts `socket(2)` and hands the child a
+// socketpair end with `SECCOMP_IOCTL_NOTIF_ADDFD`; the child's own `connect(2)`
+// is then answered by the supervisor, which dials the proxy and splices. Only
+// `socket` and `connect` need emulating for TCP, because the socketpair carries
+// the bytes natively. UDP port 53 is answered from the fake-IP pool.
+
+const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_uint = 8;
+const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
+const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
+const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeccompData {
+    nr: i32,
+    arch: u32,
+    instruction_pointer: u64,
+    args: [u64; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeccompNotif {
+    id: u64,
+    pid: u32,
+    flags: u32,
+    data: SeccompData,
+}
+
+#[repr(C)]
+struct SeccompNotifResp {
+    id: u64,
+    val: i64,
+    error: i32,
+    flags: u32,
+}
+
+#[repr(C)]
+struct SeccompNotifAddfd {
+    id: u64,
+    flags: u32,
+    srcfd: u32,
+    newfd: u32,
+    newfd_flags: u32,
+}
+
+/// The syscalls the filter stops. Everything else is allowed untouched.
+fn intercepted_syscalls() -> [libc::c_long; 10] {
+    [
+        libc::SYS_socket,
+        libc::SYS_connect,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_bind,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+    ]
+}
+
+fn install_notif_filter() -> Result<RawFd> {
+    const BPF_LD_ABS_W: u16 = 0x20;
+    const BPF_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const RET_USER_NOTIF: u32 = 0x7fc0_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+
+    let mut filter = vec![libc::sock_filter {
+        code: BPF_LD_ABS_W,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    }];
+    for syscall in intercepted_syscalls() {
+        filter.push(libc::sock_filter {
+            code: BPF_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: syscall as u32,
+        });
+        filter.push(libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: RET_USER_NOTIF,
+        });
+    }
+    filter.push(libc::sock_filter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: RET_ALLOW,
+    });
+
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut _,
+    };
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error()).context("seccomp(NEW_LISTENER)");
+    }
+    Ok(r as RawFd)
+}
+
+/// Read `len` bytes from the child at `addr`.
+fn read_mem(mem: RawFd, addr: u64, len: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut off = 0;
+    while off < len {
+        let n = unsafe {
+            libc::pread(
+                mem,
+                buf[off..].as_mut_ptr() as *mut _,
+                len - off,
+                (addr as i64) + off as i64,
+            )
+        };
+        if n <= 0 {
+            bail!("pread(/proc/pid/mem): {}", std::io::Error::last_os_error());
+        }
+        off += n as usize;
+    }
+    Ok(buf)
+}
+
+/// Write `data` into the child at `addr`.
+fn write_mem(mem: RawFd, addr: u64, data: &[u8]) -> Result<()> {
+    let mut off = 0;
+    while off < data.len() {
+        let n = unsafe {
+            libc::pwrite(
+                mem,
+                data[off..].as_ptr() as *const _,
+                data.len() - off,
+                (addr as i64) + off as i64,
+            )
+        };
+        if n <= 0 {
+            bail!("pwrite(/proc/pid/mem): {}", std::io::Error::last_os_error());
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
+fn sockaddr_in(family: u16, ip: IpAddr, port: u16) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut b = vec![0u8; 16];
+            b[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
+            b[2..4].copy_from_slice(&port.to_be_bytes());
+            b[4..8].copy_from_slice(&v4.octets());
+            b
+        }
+        IpAddr::V6(v6) => {
+            let mut b = vec![0u8; 28];
+            b[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
+            b[2..4].copy_from_slice(&port.to_be_bytes());
+            b[8..24].copy_from_slice(&v6.octets());
+            b
+        }
+    }
+}
+
+fn parse_sockaddr(bytes: &[u8]) -> Option<(u16, IpAddr, u16)> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+    match family as i32 {
+        libc::AF_INET if bytes.len() >= 8 => Some((
+            family,
+            IpAddr::V4(Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7])),
+            port,
+        )),
+        libc::AF_INET6 if bytes.len() >= 24 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&bytes[8..24]);
+            Some((family, IpAddr::V6(o.into()), port))
+        }
+        _ => None,
+    }
+}
+
+fn set_nonblocking(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        bail!("fcntl(F_GETFL): {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        bail!("fcntl(F_SETFL): {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn notif_addfd_send(lfd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> Result<i32> {
+    let req = SeccompNotifAddfd {
+        id,
+        flags: SECCOMP_ADDFD_FLAG_SEND,
+        srcfd: srcfd as u32,
+        newfd: 0,
+        newfd_flags,
+    };
+    let r = unsafe { libc::ioctl(lfd, SECCOMP_IOCTL_NOTIF_ADDFD, &req) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error()).context("NOTIF_ADDFD");
+    }
+    Ok(r)
+}
+
+fn notif_respond(lfd: RawFd, id: u64, val: i64, error: i32) -> Result<()> {
+    let resp = SeccompNotifResp {
+        id,
+        val,
+        error,
+        flags: 0,
+    };
+    let r = unsafe { libc::ioctl(lfd, SECCOMP_IOCTL_NOTIF_SEND, &resp) };
+    if r < 0 {
+        let e = std::io::Error::last_os_error();
+        // ENOENT means the target died or the syscall was interrupted.
+        if e.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(e).context("NOTIF_SEND");
+    }
+    Ok(())
+}
+
+fn notif_continue(lfd: RawFd, id: u64) -> Result<()> {
+    let resp = SeccompNotifResp {
+        id,
+        val: 0,
+        error: 0,
+        flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    };
+    let r = unsafe { libc::ioctl(lfd, SECCOMP_IOCTL_NOTIF_SEND, &resp) };
+    if r < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(e).context("NOTIF_SEND(CONTINUE)");
+    }
+    Ok(())
+}
+
+enum Sock {
+    Stream(tokio::net::UnixStream),
+    Datagram(tokio::net::UnixDatagram, Option<(IpAddr, u16)>),
+}
+
+fn run_seccomp(args: Args) -> Result<i32> {
+    if args.proxies.is_empty() {
+        bail!("the seccomp backend needs -x (there is no direct mode)");
+    }
+    // A seccomp filter is per-thread unless TSYNC is used. Install it on a
+    // helper thread and fork there: the child inherits the filter, and the
+    // listener fd stays in this process's fd table, so no SCM_RIGHTS handshake
+    // is needed (the child's own sendmsg is itself intercepted).
+    let program = args.program.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("pod-netns-filter".into())
+        .spawn(move || {
+            // Built before fork so the child allocates nothing.
+            let path = match CString::new(program[0].as_bytes()) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("program path: {e}")));
+                    return;
+                }
+            };
+            let argv: Vec<CString> = match program
+                .iter()
+                .map(|a| CString::new(a.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("argv: {e}")));
+                    return;
+                }
+            };
+            let ptrs: Vec<*const libc::c_char> = argv
+                .iter()
+                .map(|c| c.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
+
+            let lfd = match install_notif_filter() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                let _ = tx.send(Err(anyhow::anyhow!(
+                    "fork: {}",
+                    std::io::Error::last_os_error()
+                )));
+                return;
+            }
+            if pid == 0 {
+                // Child: the filter is inherited. execv with no allocation.
+                unsafe { libc::execv(path.as_ptr(), ptrs.as_ptr()) };
+                unsafe { libc::_exit(127) };
+            }
+            let _ = tx.send(Ok((lfd, pid)));
+        })?;
+    let (lfd, pid) = rx.recv().context("filter thread died")??;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(supervise_seccomp(lfd, pid, args.proxies, args.verbose))
+}
+
+async fn supervise_seccomp(
+    lfd: RawFd,
+    pid: i32,
+    proxies: Vec<Proxy>,
+    verbose: bool,
+) -> Result<i32> {
+    // NOTIF_RECV is non-blocking so the shutdown flag is observed; the fd is
+    // also pollable, so the loop sleeps on readiness rather than spinning.
+    unsafe { libc::fcntl(lfd, libc::F_SETFL, libc::O_NONBLOCK) };
+    let dup = unsafe { OwnedFd::from_raw_fd(libc::dup(lfd)) };
+    let async_fd = tokio::io::unix::AsyncFd::with_interest(dup, tokio::io::Interest::READABLE)?;
+
+    let mem_path = CString::new(format!("/proc/{pid}/mem"))?;
+    // Read access to a child's /proc/pid/mem is granted; write access is a
+    // stronger check and can be denied, so fall back to read-only.
+    let mut mem_writable = true;
+    let mut mem = unsafe { libc::open(mem_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if mem < 0 {
+        mem_writable = false;
+        mem = unsafe { libc::open(mem_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    }
+    if mem < 0 {
+        bail!("open /proc/{pid}/mem: {}", std::io::Error::last_os_error());
+    }
+
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut status = 0;
+                let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if r == pid {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+    }
+
+    let mut map: HashMap<i32, Sock> = HashMap::new();
+    let mut dns = FakeDns::new();
+
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut req: SeccompNotif = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::ioctl(lfd, SECCOMP_IOCTL_NOTIF_RECV, &mut req) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => {
+                    tokio::select! {
+                        _ = async_fd.readable() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let id = req.id;
+        let nr = req.data.nr;
+        let a = req.data.args;
+
+        let outcome = if nr == libc::SYS_socket as i32 {
+            handle_socket(lfd, id, a, &mut map)
+        } else if nr == libc::SYS_connect as i32 {
+            handle_connect(lfd, id, a, mem, &mut map, &mut dns, &proxies, verbose).await
+        } else if nr == libc::SYS_sendto as i32 {
+            handle_sendto(lfd, id, a, mem, &mut map, &mut dns).await
+        } else if nr == libc::SYS_sendmsg as i32 {
+            handle_sendmsg(lfd, id, a, mem, &mut map, &mut dns).await
+        } else if nr == libc::SYS_sendmmsg as i32 {
+            handle_sendmmsg(lfd, id, a, mem, &mut map, &mut dns).await
+        } else if nr == libc::SYS_setsockopt as i32 {
+            // An AF_UNIX socketpair rejects IP-level options, which makes
+            // glibc's resolver give up before it ever sends. Pretend.
+            if map.contains_key(&(a[0] as i32)) {
+                notif_respond(lfd, id, 0, 0)
+            } else {
+                notif_continue(lfd, id)
+            }
+        } else if nr == libc::SYS_getsockopt as i32 {
+            handle_getsockopt(lfd, id, a, mem, mem_writable, &mut map)
+        } else if nr == libc::SYS_bind as i32 {
+            // A datagram socket that binds a local port is a socketpair here;
+            // pretend the bind succeeded.
+            if map.contains_key(&(a[0] as i32)) {
+                notif_respond(lfd, id, 0, 0)
+            } else {
+                notif_continue(lfd, id)
+            }
+        } else if nr == libc::SYS_getsockname as i32 || nr == libc::SYS_getpeername as i32 {
+            handle_sockname(lfd, id, a, mem, mem_writable, &mut map)
+        } else {
+            notif_continue(lfd, id)
+        };
+        if let Err(e) = outcome {
+            if verbose {
+                eprintln!("pod-netns: notif {nr}: {e:#}");
+            }
+        }
+    }
+    unsafe { libc::close(mem) };
+
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    Ok(if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    })
+}
+
+fn handle_socket(lfd: RawFd, id: u64, a: [u64; 6], map: &mut HashMap<i32, Sock>) -> Result<()> {
+    let domain = a[0] as i32;
+    let ty = a[1] as i32;
+    let kind = ty & 0xf; // SOCK_STREAM=1, SOCK_DGRAM=2
+    let inet = domain == libc::AF_INET || domain == libc::AF_INET6;
+    if !inet || (kind != libc::SOCK_STREAM && kind != libc::SOCK_DGRAM) {
+        return notif_continue(lfd, id);
+    }
+    // ADDFD only accepts O_CLOEXEC in newfd_flags on older kernels, so
+    // SOCK_NONBLOCK is applied to the shared description instead: the child's
+    // fd is a dup of `theirs`, so the flag is inherited.
+    let mut newfd_flags = 0u32;
+    if ty & libc::SOCK_CLOEXEC != 0 {
+        newfd_flags |= libc::O_CLOEXEC as u32;
+    }
+    let nonblocking = ty & libc::SOCK_NONBLOCK != 0;
+    if kind == libc::SOCK_STREAM {
+        // A std pair is blocking on both ends; only the supervisor's end is
+        // made non-blocking, so the child gets a blocking socket unless it
+        // asked for SOCK_NONBLOCK.
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+        set_nonblocking(ours.as_raw_fd())?;
+        if nonblocking {
+            set_nonblocking(theirs.as_raw_fd())?;
+        }
+        let child_fd = notif_addfd_send(lfd, id, theirs.as_raw_fd(), newfd_flags)?;
+        drop(theirs);
+        map.insert(
+            child_fd,
+            Sock::Stream(tokio::net::UnixStream::from_std(ours)?),
+        );
+    } else {
+        let (ours, theirs) = std::os::unix::net::UnixDatagram::pair()?;
+        set_nonblocking(ours.as_raw_fd())?;
+        if nonblocking {
+            set_nonblocking(theirs.as_raw_fd())?;
+        }
+        let child_fd = notif_addfd_send(lfd, id, theirs.as_raw_fd(), newfd_flags)?;
+        drop(theirs);
+        map.insert(
+            child_fd,
+            Sock::Datagram(tokio::net::UnixDatagram::from_std(ours)?, None),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_connect(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    map: &mut HashMap<i32, Sock>,
+    dns: &mut FakeDns,
+    proxies: &[Proxy],
+    verbose: bool,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let is_datagram = matches!(map.get(&fd), Some(Sock::Datagram(..)));
+    if !map.contains_key(&fd) {
+        return notif_continue(lfd, id);
+    }
+    let addr = read_mem(mem, a[1], (a[2] as usize).min(128))?;
+    let Some((_family, ip, port)) = parse_sockaddr(&addr) else {
+        return notif_respond(lfd, id, -1, libc::EAFNOSUPPORT);
+    };
+    if is_datagram {
+        if let Some(Sock::Datagram(_, dest)) = map.get_mut(&fd) {
+            *dest = Some((ip, port));
+        }
+        return notif_respond(lfd, id, 0, 0);
+    }
+    let target = match ip {
+        IpAddr::V4(v4) => match dns.name_for(v4) {
+            Some(name) => format!("{name}:{port}"),
+            None => format!("{v4}:{port}"),
+        },
+        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+    };
+    if verbose {
+        eprintln!("pod-netns: connect {target} via {}", proxies[0].endpoint());
+    }
+    match connect_upstream_async(&proxies[0], &target).await {
+        Ok(mut upstream) => {
+            notif_respond(lfd, id, 0, 0)?;
+            if let Some(Sock::Stream(mut pair)) = map.remove(&fd) {
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut pair, &mut upstream).await;
+                });
+            }
+        }
+        Err(e) => {
+            if verbose {
+                eprintln!("pod-netns: upstream for {target} failed: {e:#}");
+            }
+            notif_respond(lfd, id, -1, libc::ECONNREFUSED)?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_sendto(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    map: &mut HashMap<i32, Sock>,
+    dns: &mut FakeDns,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let buf = a[1];
+    let len = a[2] as usize;
+    let name = a[4];
+    let namelen = a[5] as usize;
+    let Some(Sock::Datagram(_, recorded)) = map.get(&fd) else {
+        return notif_continue(lfd, id);
+    };
+    let recorded = *recorded;
+    let target = if name != 0 && namelen >= 4 {
+        parse_sockaddr(&read_mem(mem, name, namelen.min(128))?)
+            .map(|(_, ip, port)| (ip, port))
+            .or(recorded)
+    } else {
+        recorded
+    };
+    let Some((_ip, port)) = target else {
+        return notif_respond(lfd, id, -1, libc::EDESTADDRREQ);
+    };
+    if port != DNS_PORT {
+        return notif_respond(lfd, id, -1, libc::ENETUNREACH);
+    }
+    let query = read_mem(mem, buf, len)?;
+    let Ok(parsed) = cfrs::vnet::dns::ParsedQuery::parse(&query) else {
+        return notif_respond(lfd, id, -1, libc::EINVAL);
+    };
+    let ip = dns.address_for(&parsed.name);
+    let reply = cfrs::vnet::dns::build_response(&parsed, &[IpAddr::V4(ip)], 0);
+    if let Some(Sock::Datagram(pair, _)) = map.get(&fd) {
+        let _ = pair.send(&reply).await;
+    }
+    notif_respond(lfd, id, len as i64, 0)
+}
+
+/// `sendmmsg` is what glibc's resolver uses: a vector of `mmsghdr`. Only the
+/// first message is answered; a DNS retry in the same call is rare.
+async fn handle_sendmmsg(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    map: &mut HashMap<i32, Sock>,
+    dns: &mut FakeDns,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let msgvec = a[1];
+    let vlen = a[2] as usize;
+    if vlen == 0 {
+        return notif_respond(lfd, id, 0, 0);
+    }
+    // struct mmsghdr = struct msghdr (56 bytes) + u32 msg_len + padding.
+    handle_sendmsg(lfd, id, [fd as u64, msgvec, 0, 0, 0, 0], mem, map, dns).await
+}
+
+async fn handle_sendmsg(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    map: &mut HashMap<i32, Sock>,
+    dns: &mut FakeDns,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let msg_ptr = a[1];
+    let Some(Sock::Datagram(_, recorded)) = map.get(&fd) else {
+        return notif_continue(lfd, id);
+    };
+    let recorded = *recorded;
+    // struct msghdr on x86_64: name, namelen, iov, iovlen, control, controllen, flags.
+    let hdr = read_mem(mem, msg_ptr, 56)?;
+    let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+    let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+    let iov_ptr = u64::from_ne_bytes(hdr[16..24].try_into().unwrap());
+    let iov_len = u64::from_ne_bytes(hdr[24..32].try_into().unwrap()) as usize;
+    let target = if name_ptr != 0 && name_len >= 4 {
+        parse_sockaddr(&read_mem(mem, name_ptr, name_len.min(128))?)
+            .map(|(_, ip, port)| (ip, port))
+            .or(recorded)
+    } else {
+        recorded
+    };
+    let Some((_ip, port)) = target else {
+        return notif_respond(lfd, id, -1, libc::EDESTADDRREQ);
+    };
+    if port != DNS_PORT {
+        return notif_respond(lfd, id, -1, libc::ENETUNREACH);
+    }
+    let mut query = Vec::new();
+    for i in 0..iov_len.min(8) {
+        let iov = read_mem(mem, iov_ptr + (i as u64) * 16, 16)?;
+        let base = u64::from_ne_bytes(iov[0..8].try_into().unwrap());
+        let len = u64::from_ne_bytes(iov[8..16].try_into().unwrap()) as usize;
+        if len == 0 {
+            continue;
+        }
+        query.extend_from_slice(&read_mem(mem, base, len.min(4096))?);
+    }
+    let Ok(parsed) = cfrs::vnet::dns::ParsedQuery::parse(&query) else {
+        return notif_respond(lfd, id, -1, libc::EINVAL);
+    };
+    let ip = dns.address_for(&parsed.name);
+    let reply = cfrs::vnet::dns::build_response(&parsed, &[IpAddr::V4(ip)], 0);
+    if let Some(Sock::Datagram(pair, _)) = map.get(&fd) {
+        let _ = pair.send(&reply).await;
+    }
+    notif_respond(lfd, id, query.len() as i64, 0)
+}
+
+fn handle_getsockopt(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    writable: bool,
+    map: &mut HashMap<i32, Sock>,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let level = a[1] as i32;
+    let optname = a[2] as i32;
+    let optval = a[3];
+    let optlen_ptr = a[4];
+    let Some(entry) = map.get(&fd) else {
+        return notif_continue(lfd, id);
+    };
+    if !writable || optval == 0 || optlen_ptr == 0 {
+        return notif_continue(lfd, id);
+    }
+    let len = read_mem(mem, optlen_ptr, 4)?;
+    let len = u32::from_ne_bytes(len[..4].try_into().unwrap()) as usize;
+    if len == 0 || len > 256 {
+        return notif_continue(lfd, id);
+    }
+    let mut val = vec![0u8; len];
+    if level == libc::SOL_SOCKET && optname == libc::SO_TYPE {
+        let ty = match entry {
+            Sock::Stream(_) => libc::SOCK_STREAM,
+            Sock::Datagram(..) => libc::SOCK_DGRAM,
+        };
+        let b = (ty as u32).to_ne_bytes();
+        val[..4].copy_from_slice(&b);
+    }
+    write_mem(mem, optval, &val)?;
+    notif_respond(lfd, id, 0, 0)
+}
+
+fn handle_sockname(
+    lfd: RawFd,
+    id: u64,
+    a: [u64; 6],
+    mem: RawFd,
+    writable: bool,
+    map: &mut HashMap<i32, Sock>,
+) -> Result<()> {
+    let fd = a[0] as i32;
+    let Some(entry) = map.get(&fd) else {
+        return notif_continue(lfd, id);
+    };
+    if !writable {
+        // Cannot rewrite the caller's sockaddr; let the kernel answer (it will
+        // report the AF_UNIX socketpair).
+        return notif_continue(lfd, id);
+    }
+    // Answer with a plausible INET address so a program that checks it does not
+    // see an AF_UNIX socketpair.
+    let (ip, port) = match entry {
+        Sock::Stream(_) => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Sock::Datagram(_, dest) => dest.unwrap_or((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+    };
+    let family = if ip.is_ipv4() {
+        libc::AF_INET as u16
+    } else {
+        libc::AF_INET6 as u16
+    };
+    let bytes = sockaddr_in(family, ip, port);
+    let out_len = (bytes.len() as u64).to_ne_bytes();
+    write_mem(mem, a[2], &out_len)?;
+    if a[1] != 0 {
+        write_mem(mem, a[1], &bytes)?;
+    }
+    notif_respond(lfd, id, 0, 0)
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_args(&argv) {
@@ -1273,7 +2232,22 @@ fn main() {
     if args.doctor {
         std::process::exit(doctor());
     }
-    match run(args) {
+    let result = match args.backend {
+        BackendKind::Netns => run(args),
+        BackendKind::Seccomp => run_seccomp(args),
+        BackendKind::Auto => {
+            // The netns backend needs unshare and a TUN; without them the
+            // seccomp backend is the only thing that can work.
+            if probe_unshare(libc::CLONE_NEWNET).ok
+                || probe_unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET).ok
+            {
+                run(args)
+            } else {
+                run_seccomp(args)
+            }
+        }
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("pod-netns: {e:#}");
