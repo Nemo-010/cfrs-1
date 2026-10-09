@@ -48,7 +48,12 @@ pub const PROXY_SRC_HEADER: &str = "Cf-Cloudflared-Proxy-Src";
 /// Headers are encoded as base64 of the name, then base64 of the value, joined
 /// by `;` and repeated after a colon. That is not a conventional format; it is
 /// what `connection/header.go` does.
-const REQUEST_HEADERS_HEADER: &str = "cf-cloudflared-request-headers";
+///
+/// Only the response direction uses it. `RequestUserHeaders` is defined in
+/// header.go and referenced nowhere else upstream, because the edge sends the
+/// visitor request as ordinary HTTP/2 headers; only an origin response has to
+/// be serialized, so that HTTP/2 header validation is not applied to values
+/// that came from an HTTP/1 origin.
 const RESPONSE_HEADERS_HEADER: &str = "cf-cloudflared-response-headers";
 const RESPONSE_META_HEADER: &str = "cf-cloudflared-response-meta";
 
@@ -701,8 +706,11 @@ mod protocol_tests {
             "1.2.3.4"
         );
         assert!(
-            request.headers().get(REQUEST_HEADERS_HEADER).is_none(),
-            "the request direction is not serialized"
+            request
+                .headers()
+                .get("cf-cloudflared-request-headers")
+                .is_none(),
+            "the request direction is not serialized; RequestUserHeaders is dead upstream"
         );
         assert_eq!(request.method(), "POST");
         assert_eq!(request.uri().path(), "/api/x");
@@ -762,13 +770,6 @@ mod protocol_tests {
         let request = build_visitor_request("GET", "/", "example.com", &[]);
         assert_eq!(request.headers().get("host").unwrap(), "example.com");
         assert_eq!(request.headers().len(), 1, "only the host header");
-    }
-
-    fn response_headers() -> Vec<(String, String)> {
-        vec![(
-            RESPONSE_HEADERS_HEADER.to_string(),
-            encode_headers(&[("content-type".into(), "text/plain".into())]),
-        )]
     }
 
     #[test]
@@ -969,8 +970,8 @@ mod protocol_tests {
             "Cf-Cloudflared-Proxy-Connection-Upgrade"
         );
         assert_eq!(super::PROXY_SRC_HEADER, "Cf-Cloudflared-Proxy-Src");
-        assert_eq!(REQUEST_HEADERS_HEADER, "cf-cloudflared-request-headers");
         assert_eq!(RESPONSE_HEADERS_HEADER, "cf-cloudflared-response-headers");
+        // RequestUserHeaders exists upstream but is referenced nowhere there.
         assert_eq!(RESPONSE_META_HEADER, "cf-cloudflared-response-meta");
     }
 }

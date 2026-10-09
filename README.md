@@ -6,16 +6,23 @@ stock `cloudflared` binary cannot run.
 `cloudflared` is a 40 MB Go binary that assumes it can bind a TCP port, resolve
 DNS, and open UDP to a Cloudflare edge. In a locked-down sandbox it does none
 of those things, and it has no HTTP-proxy flag for its edge connection, so it
-fails before it reaches Cloudflare at all. `cfrs` implements the part of the
-protocol that still works under those constraints, and adds a transport that
-completes a working public URL.
+fails before it reaches Cloudflare at all.
 
-Two things work here, and this crate does both:
+**What works today.** Two things, and this crate does both:
 
 1. **Anonymous Cloudflare quick-tunnel provisioning**, credential-free, the same
    `POST /tunnel` call `cloudflared` makes.
 2. **Actually exposing a server on the public web** from an origin that can
    only be a unix socket, over an HTTP CONNECT proxy with no direct egress.
+
+**What does not work yet.** `cfrs tunnel` does not serve traffic. It loads
+ingress rules, resolves the edge, provisions credentials and prints a URL, but
+the HTTP/2 and QUIC transports are not driven by a serving loop, so no
+connection is registered and no visitor is ever served. The transports build
+connections and frame messages; nothing consumes them. Port 7844 is blocked
+from the sandbox this was written in, so that part could not be tested against
+the real edge either. `cfrs serve` is the path that produces a working public
+URL here.
 
 ## Install
 
@@ -99,7 +106,7 @@ resolves the hostname. Live output from the Rust binary:
 
 ```
 $ cfrs provision
-cfrs: requesting a quick tunnel from https://api.trycloudflare.com via 169.254.169.1:44561 (no credentials)
+cfrs: requesting a quick tunnel from https://api.trycloudflare.com via 169.254.169.1:44561
 url:     https://day-carroll-healing-consolidated.trycloudflare.com
 id:      2983af16-7c68-4ef0-9590-e05f35a0cd7b
 account: 5ab4e9dfbd435d24068829fda0077963
@@ -214,6 +221,29 @@ reads to EOF waits forever. Both halves of that are pinned by
 which fails if the end-of-request signal is removed (verified by injecting the
 regression and watching it fail).
 
+### Checking the wire format against the reference, not against my reading of it
+
+Header serialization was initially wrong in three ways: padded base64 where
+cloudflared uses `base64.RawStdEncoding`, a trailing `;` that `SerializeHeaders`
+does not emit, and header names that were not canonicalized through
+`textproto.CanonicalMIMEHeaderKey` the way Go canonicalizes them. All three were
+invisible to a unit test written from the same reading of the source that
+produced the bug.
+
+`tools/check-header-oracle.sh` closes that gap. It builds a verbatim copy of
+`SerializeHeaders`, runs it, and diffs its output against `encode_headers` on
+five cases. It also diffs against `tools/header-oracle.txt`, a captured run, so
+the check survives a machine with no Go toolchain. `cargo test` asserts the same
+recorded output, which is what catches a change to the encoding.
+
+Running it against the reference is what caught a base64 literal I had written by
+hand that was wrong in a single character: the base64 of the header name
+`Cf-Connecting-Ip`, one letter off. It passed a unit test written from the same
+reading of the source that produced it. Reproducing that literal in prose is
+just as easy as it was in the test, which is why the corrected value lives in
+`tools/header-oracle.txt` and is asserted from there rather than written down a
+second time.
+
 ### Why the CONNECT proxy layer is generic
 
 `proxy::connect_tunnel` returns a plain byte pipe, so anything that runs on TCP
@@ -237,9 +267,11 @@ without binding a socket, which a sandbox may refuse to do.
 | `src/tunnel/mod.rs` | configuration, ingress routing, request preparation |
 | `src/feature/mod.rs` | QR rendering and the feature flag surface |
 | `src/util/` | HTTP head parsing, TLS helpers, metrics |
-| `src/bin/cfrs.rs` | CLI: `provision`, `serve`, `tunnel`, `metrics` |
+| `src/bin/cfrs.rs` | CLI: `tunnel`, `provision`, `serve`, `connect`, `qr`, `doctor`, `metrics` |
 | `tools/cf-origin.rs` | test origin, serves over a unix socket with a marker |
 | `tools/prove-exposure.sh` | end-to-end proof, origin to public URL |
+| `tools/check-header-oracle.sh` | diff our header encoding against cloudflared's own Go code |
+| `tools/header-oracle.txt` | captured oracle output, asserted by a test |
 
 ## Tests
 
@@ -247,9 +279,17 @@ without binding a socket, which a sandbox may refuse to do.
 cargo test
 ```
 
-33 tests, including a provisioning response captured from the live service, the
+211 tests, including a provisioning response captured from the live service, the
 allow-list refusal string, byte-coalescing on the CONNECT response, URL
 extraction from real relay output, and the splice ordering regression above.
+
+The header-encoding tests are checked against `tools/header-oracle.txt` rather
+than against literals typed into the test, which is deliberate: a base64 literal
+written by eye is easy to get wrong and hard to notice.
+
+`tools/check-header-oracle.sh` is not part of `cargo test`. Run it to rebuild
+the Go reference and re-diff; it needs a Go toolchain, so it is kept out of the
+test run so that `cargo test` works without one.
 
 ## Licence
 

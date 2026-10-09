@@ -438,6 +438,7 @@ mod tests {
 
         let (secure, host, port, path) = parse_ws_url("ws://relay.example.com").unwrap();
         assert!(!secure);
+        assert_eq!(host, "relay.example.com");
         assert_eq!(port, 80);
         assert_eq!(path, "/", "a pathless url means /");
     }
