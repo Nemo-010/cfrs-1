@@ -110,10 +110,9 @@ impl Dialer {
             })?;
             return Ok(Conn::Direct(TcpStream::connect(addr).await?));
         }
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("tailscaled refused the dial (status {status})"),
-        ))
+        Err(io::Error::other(format!(
+            "tailscaled refused the dial (status {status})"
+        )))
     }
 }
 

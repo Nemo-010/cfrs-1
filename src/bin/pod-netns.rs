@@ -82,8 +82,10 @@ enum BackendKind {
 struct Args {
     proxies: Vec<Proxy>,
     rules: Vec<Rule>,
+    maps: Vec<(String, IpAddr)>,
     program: Vec<String>,
     doctor: bool,
+    doctor_json: bool,
     verbose: bool,
     inbound_dir: std::path::PathBuf,
     serve: Option<cfrs::vnet::proxy::ProxyListen>,
@@ -92,20 +94,35 @@ struct Args {
 
 fn usage() -> String {
     "\
-pod-netns — run a program in a netns with all egress through a proxy
+pod-netns — run a program with all egress through a proxy, without shims
 
 USAGE:
     pod-netns [OPTIONS] -- PROGRAM [ARGS...]
-    pod-netns doctor
+    pod-netns doctor [--json]
+    pod-netns --serve LISTEN -x PROXY
 
 OPTIONS:
-    -x, --proxy SPEC     Upstream proxy: socks5://[user:pass@]host:port or
-                         http://[user:pass@]host:port (repeatable)
-    -v, --verbose        Log each flow
-    -h, --help           This text
+    -x, --proxy SPEC       Upstream proxy, repeatable; more than one chains:
+                             socks5://[user:pass@]host:port
+                             http://[user:pass@]host:port
+                             socks5://unix:/path     (unix-socket proxy)
+                             tailscale:/path/to/tailscaled.sock
+                           Default: $ALL_PROXY, $HTTPS_PROXY or $HTTP_PROXY
+    -r, --rule SPEC        Per-destination route; first match wins:
+                             domain:NAME=socks5://host:port
+                             cidr:10.0.0.0/8=socks5://host:port
+        --map NAME=ADDR    Resolve NAME to ADDR locally, repeatable
+        --backend NAME     auto (default), netns or seccomp
+        --inbound-dir DIR  Where a bound port is exposed as a unix socket
+                           [default: /tmp/pod-netns-inbound]
+        --serve LISTEN     Serve SOCKS5, HTTP CONNECT and UDP ASSOCIATE on
+                           unix:/path or tcp://host:port, forwarding through
+                           the -x chain
+    -v, --verbose          Log each flow
+    -V, --version          Print the version and exit
+    -h, --help             This text
 
-The first proxy is the default route. Requires unprivileged user namespaces and
-/dev/net/tun; run `pod-netns doctor` to measure them.
+doctor measures what the host permits and exits 3 when no backend can run.
 "
     .to_string()
 }
@@ -115,7 +132,9 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     let mut rules = Vec::new();
     let mut program = Vec::new();
     let mut doctor = false;
+    let mut doctor_json = false;
     let mut verbose = false;
+    let mut maps: Vec<(String, IpAddr)> = Vec::new();
     let mut backend = BackendKind::Auto;
     let mut inbound_dir = std::path::PathBuf::from("/tmp/pod-netns-inbound");
     let mut serve: Option<cfrs::vnet::proxy::ProxyListen> = None;
@@ -129,6 +148,23 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "doctor" if i == 0 => {
                 doctor = true;
                 i += 1;
+                if argv.get(i).map(String::as_str) == Some("--json") {
+                    doctor_json = true;
+                    i += 1;
+                }
+            }
+            "-V" | "--version" => {
+                println!("pod-netns {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--map" => {
+                let spec = argv.get(i + 1).context("--map needs NAME=ADDR")?;
+                let (name, addr) = spec.split_once('=').context("--map needs NAME=ADDR")?;
+                if name.is_empty() {
+                    bail!("--map has an empty name");
+                }
+                maps.push((name.to_string(), addr.parse().context("--map address")?));
+                i += 2;
             }
             "-h" | "--help" => {
                 print!("{}", usage());
@@ -222,8 +258,10 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     Ok(Args {
         proxies,
         rules,
+        maps,
         program,
         doctor,
+        doctor_json,
         verbose,
         inbound_dir,
         serve,
@@ -425,7 +463,7 @@ fn probe_mem_write() -> Probe {
     }
 }
 
-fn doctor() -> i32 {
+fn doctor(json: bool) -> i32 {
     let probes = [
         probe_unshare(libc::CLONE_NEWNET),
         probe_unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET),
@@ -434,6 +472,33 @@ fn doctor() -> i32 {
         probe_seccomp_notif(),
         probe_mem_write(),
     ];
+    let netns_available = (probes[0].ok || probes[1].ok) && probes[2].ok;
+    let seccomp_available = probes[4].ok;
+    let any = netns_available || seccomp_available;
+
+    if json {
+        let mut root = serde_json::Map::new();
+        let capabilities: serde_json::Map<String, serde_json::Value> = probes
+            .iter()
+            .map(|p| {
+                (
+                    p.name.to_string(),
+                    serde_json::json!({ "ok": p.ok, "detail": p.detail }),
+                )
+            })
+            .collect();
+        root.insert("capabilities".into(), capabilities.into());
+        root.insert("backend_netns".into(), netns_available.into());
+        root.insert("backend_seccomp".into(), seccomp_available.into());
+        root.insert("backend_available".into(), any.into());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(root))
+                .unwrap_or_else(|_| "{}".to_string())
+        );
+        return if any { 0 } else { EXIT_NO_BACKEND };
+    }
+
     println!("pod-netns: capability report");
     for p in &probes {
         println!(
@@ -443,22 +508,22 @@ fn doctor() -> i32 {
             p.detail
         );
     }
-    // The netns backend needs a network namespace and a TUN device.
-    let netns_ok = probes[0].ok || probes[1].ok;
-    if netns_ok && probes[2].ok {
-        println!("pod-netns: backend netns: available");
-        return 0;
-    }
-    println!("pod-netns: backend netns: unavailable");
-    if probes[3].ok {
+    println!(
+        "pod-netns: backend netns:   {}",
+        if netns_available { "available" } else { "unavailable" }
+    );
+    println!(
+        "pod-netns: backend seccomp: {}",
+        if seccomp_available { "available" } else { "unavailable" }
+    );
+    if probes[3].ok && !any {
         println!("pod-netns: note: descendant ptrace works, so a ptrace backend could run here");
     }
-    if probes[4].ok {
-        println!(
-            "pod-netns: note: SECCOMP_RET_USER_NOTIF works, so a seccomp backend could run here"
-        );
+    if any {
+        0
+    } else {
+        EXIT_NO_BACKEND
     }
-    EXIT_NO_BACKEND
 }
 
 // ── namespace + TUN setup (child side) ──────────────────────────────────────
@@ -676,10 +741,12 @@ fn recv_fd(sock: RawFd) -> Result<RawFd> {
         bail!("no fd in the received message");
     }
     let mut fd: RawFd = -1;
+    // Copy bytes, not elements: with `*mut RawFd` a count of
+    // `size_of::<RawFd>()` would write four fds' worth into one.
     unsafe {
         std::ptr::copy_nonoverlapping(
-            CMSG_DATA(hdr) as *const RawFd,
-            &mut fd,
+            CMSG_DATA(hdr) as *const u8,
+            (&mut fd as *mut RawFd).cast::<u8>(),
             std::mem::size_of::<RawFd>(),
         );
     }
@@ -782,6 +849,13 @@ struct FakeDns {
 }
 
 impl FakeDns {
+    /// Pin a name to a real address, so it resolves locally with no fake IP.
+    fn pin(&mut self, name: &str, ip: IpAddr) {
+        if let IpAddr::V4(v4) = ip {
+            self.by_name.insert(name.to_string(), v4);
+        }
+    }
+
     fn new() -> Self {
         Self {
             by_ip: HashMap::new(),
@@ -826,11 +900,18 @@ struct Backend {
     listeners: HashMap<u16, SocketHandle>,
     flows: HashMap<SocketHandle, Flow>,
     proxies: Vec<Proxy>,
+    rules: Vec<Rule>,
     verbose: bool,
 }
 
 impl Backend {
-    fn new(fd: RawFd, proxies: Vec<Proxy>, verbose: bool) -> Result<Self> {
+    fn new(
+        fd: RawFd,
+        proxies: Vec<Proxy>,
+        rules: Vec<Rule>,
+        maps: Vec<(String, IpAddr)>,
+        verbose: bool,
+    ) -> Result<Self> {
         let mut device = Tun::new(fd, TUN_MTU);
         let mut config = IfaceConfig::new(HardwareAddress::Ip);
         config.random_seed = seed();
@@ -850,15 +931,20 @@ impl Backend {
 
         let mut sockets = SocketSet::new(Vec::new());
         let dns_socket = add_udp(&mut sockets, DNS_PORT);
+        let mut dns = FakeDns::new();
+        for (name, ip) in &maps {
+            dns.pin(name, *ip);
+        }
         Ok(Self {
             device,
             interface,
             sockets,
             dns_socket,
-            dns: FakeDns::new(),
+            dns,
             listeners: HashMap::new(),
             flows: HashMap::new(),
             proxies,
+            rules,
             verbose,
         })
     }
@@ -875,6 +961,11 @@ impl Backend {
             }
         }
         for port in new_ports {
+            // Bound the table: a program that sweeps ports must not grow it
+            // without limit.
+            if self.listeners.len() >= MAX_TRACKED_FDS {
+                break;
+            }
             let mut socket = tcp_socket();
             let endpoint = IpListenEndpoint { addr: None, port };
             if socket.listen(endpoint).is_ok() {
@@ -941,7 +1032,7 @@ impl Backend {
                     None => format!("{dst_ip}:{}", local.port),
                 }
             };
-            let proxy = self.proxies[0].clone();
+            let proxy = select_chain(&self.rules, &self.proxies, &target)[0].clone();
             if self.verbose {
                 eprintln!("pod-netns: {target} via {}", proxy.endpoint());
             }
@@ -1120,9 +1211,11 @@ fn run(args: Args) -> Result<i32> {
         .enable_all()
         .build()?;
     let proxies = args.proxies.clone();
+    let rules = args.rules.clone();
+    let maps = args.maps.clone();
     let verbose = args.verbose;
     let result = runtime.block_on(async move {
-        let mut backend = Backend::new(tun_fd, proxies, verbose)?;
+        let mut backend = Backend::new(tun_fd, proxies, rules, maps, verbose)?;
         let fd = backend.device.fd;
         let async_fd = tokio::io::unix::AsyncFd::with_interest(
             unsafe { OwnedFd::from_raw_fd(libc::dup(fd)) },
@@ -1544,7 +1637,7 @@ async fn serve_udp_associate(
     let client: Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     // client -> upstream
-    {
+    let to_upstream = {
         let relay = relay.clone();
         let up = up.clone();
         let client = client.clone();
@@ -1557,10 +1650,10 @@ async fn serve_udp_associate(
                 }
                 let _ = up.send_to(&buf[..n], up_addr).await;
             }
-        });
-    }
+        })
+    };
     // upstream -> client
-    {
+    let to_client = {
         let relay = relay.clone();
         let up = up.clone();
         let client = client.clone();
@@ -1571,11 +1664,14 @@ async fn serve_udp_associate(
                     let _ = relay.send_to(&buf[..n], to).await;
                 }
             }
-        });
-    }
-    // Hold the control connection until the client closes it.
+        })
+    };
+    // Hold the control connection until the client closes it, then stop the
+    // relay tasks rather than leaving them holding the sockets.
     let mut byte = [0u8; 1];
     while control.read(&mut byte).await.unwrap_or(0) == 1 {}
+    to_upstream.abort();
+    to_client.abort();
     Ok(())
 }
 
@@ -1633,7 +1729,7 @@ struct SeccompNotifAddfd {
 }
 
 /// The syscalls the filter stops. Everything else is allowed untouched.
-fn intercepted_syscalls() -> [libc::c_long; 16] {
+fn intercepted_syscalls() -> [libc::c_long; 17] {
     [
         libc::SYS_socket,
         libc::SYS_connect,
@@ -1646,6 +1742,7 @@ fn intercepted_syscalls() -> [libc::c_long; 16] {
         libc::SYS_setsockopt,
         libc::SYS_getsockopt,
         libc::SYS_io_uring_setup,
+        libc::SYS_close,
         libc::SYS_listen,
         libc::SYS_accept,
         libc::SYS_accept4,
@@ -1751,14 +1848,14 @@ fn sockaddr_in(family: u16, ip: IpAddr, port: u16) -> Vec<u8> {
     match ip {
         IpAddr::V4(v4) => {
             let mut b = vec![0u8; 16];
-            b[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
+            b[0..2].copy_from_slice(&family.to_ne_bytes());
             b[2..4].copy_from_slice(&port.to_be_bytes());
             b[4..8].copy_from_slice(&v4.octets());
             b
         }
         IpAddr::V6(v6) => {
             let mut b = vec![0u8; 28];
-            b[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
+            b[0..2].copy_from_slice(&family.to_ne_bytes());
             b[2..4].copy_from_slice(&port.to_be_bytes());
             b[8..24].copy_from_slice(&v6.octets());
             b
@@ -1948,6 +2045,7 @@ fn run_seccomp(args: Args) -> Result<i32> {
         pid,
         args.proxies,
         args.rules,
+        args.maps,
         args.verbose,
         args.inbound_dir,
     ))
@@ -1958,6 +2056,7 @@ async fn supervise_seccomp(
     pid: i32,
     proxies: Vec<Proxy>,
     rules: Vec<Rule>,
+    maps: Vec<(String, IpAddr)>,
     verbose: bool,
     inbound_dir: std::path::PathBuf,
 ) -> Result<i32> {
@@ -2005,6 +2104,9 @@ async fn supervise_seccomp(
 
     let mut map: HashMap<i32, Sock> = HashMap::new();
     let mut dns = FakeDns::new();
+    for (name, ip) in &maps {
+        dns.pin(name, *ip);
+    }
 
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         let mut req: SeccompNotif = unsafe { std::mem::zeroed() };
@@ -2049,6 +2151,11 @@ async fn supervise_seccomp(
             }
         } else if nr == libc::SYS_getsockopt as i32 {
             handle_getsockopt(lfd, id, a, mem, mem_writable, &mut map)
+        } else if nr == libc::SYS_close as i32 {
+            // Drop the supervisor's end when the child closes an injected fd,
+            // or the table and its socketpairs grow for the process lifetime.
+            map.remove(&(a[0] as i32));
+            notif_continue(lfd, id)
         } else if nr == libc::SYS_io_uring_setup as i32 {
             // io_uring submits network operations without the intercepted
             // syscalls, which would bypass this filter entirely. Refuse it.
@@ -2081,7 +2188,14 @@ async fn supervise_seccomp(
     })
 }
 
+/// Above this many tracked descriptors the child is refused more, so a program
+/// that leaks sockets cannot grow the supervisor without bound.
+const MAX_TRACKED_FDS: usize = 4096;
+
 fn handle_socket(lfd: RawFd, id: u64, a: [u64; 6], map: &mut HashMap<i32, Sock>) -> Result<()> {
+    if map.len() >= MAX_TRACKED_FDS {
+        return notif_respond(lfd, id, -1, libc::EMFILE);
+    }
     let domain = a[0] as i32;
     let ty = a[1] as i32;
     let kind = ty & 0xf; // SOCK_STREAM=1, SOCK_DGRAM=2
@@ -2447,14 +2561,9 @@ async fn handle_listen(
         .with_context(|| format!("bind inbound listener {}", path.display()))?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((conn, _)) => {
-                    if tx.send(conn).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok((conn, _)) = listener.accept().await {
+            if tx.send(conn).is_err() {
+                break;
             }
         }
     });
@@ -2593,7 +2702,7 @@ fn main() {
         }
     };
     if args.doctor {
-        std::process::exit(doctor());
+        std::process::exit(doctor(args.doctor_json));
     }
     if args.serve.is_some() {
         if args.proxies.is_empty() {

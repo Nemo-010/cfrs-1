@@ -187,6 +187,30 @@ int main(void) {
 }
 "#;
 
+const DNS_CLIENT: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+int main(void) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    int r = getaddrinfo("example.com", "80", &hints, &res);
+    if (r != 0) { printf("GAI:%d\n", r); return 1; }
+    char ip[64] = {0};
+    inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr, ip, sizeof ip);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(s, res->ai_addr, res->ai_addrlen) < 0) { perror("connect"); return 1; }
+    char b[64] = {0};
+    int n = read(s, b, sizeof b - 1);
+    printf("DNS:%s:%d:%s", ip, n, b);
+    return 0;
+}
+"#;
+
 const IPV6_CLIENT: &str = r#"
 #include <stdio.h>
 #include <string.h>
@@ -721,4 +745,47 @@ fn seccomp_backend_uses_an_ambient_proxy() {
         String::from_utf8_lossy(&output.stdout)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn seccomp_backend_pins_names_with_map() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-map-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("socks.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || socks5_proxy(listener, tx, false));
+
+    let program = build_program(&dir, "client-map", DNS_CLIENT, false);
+    let output = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--backend", "seccomp", "--map", "example.com=1.2.3.4", "-x"])
+        .arg(format!("unix:{}", sock.display()))
+        .arg("--")
+        .arg(&program)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("DNS:1.2.3.4:18:HELLO-FROM-TARGET"), "{stdout:?}");
+    // The pinned address reaches the proxy, not a fake IP.
+    assert_eq!(rx.recv().unwrap(), "1.2.3.4:80");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn doctor_json_is_machine_readable() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor --json is JSON");
+    assert!(value["capabilities"].is_object());
+    assert!(value["backend_seccomp"].is_boolean());
+    assert!(value["backend_available"].is_boolean());
+    // The exit code must agree with the report.
+    let any = value["backend_available"].as_bool().unwrap();
+    assert_eq!(out.status.success(), any);
 }

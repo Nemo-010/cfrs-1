@@ -474,9 +474,7 @@ pub async fn dial_proxy(proxy: &Proxy) -> Result<Upstream> {
     }
 }
 
-/// Establish (once) the proxy's UDP association for this datagram socket and
-/// pump replies back to the child.
-
+/// Wrap a datagram in a SOCKS5 UDP request header.
 pub fn wrap_udp(payload: &[u8], ip: IpAddr, port: u16) -> Vec<u8> {
     let mut out = vec![0u8, 0, 0];
     match ip {

@@ -176,6 +176,12 @@ to the tailnet with stock Tailscale:
 tailscale serve --bg --tcp 8080 unix:/tmp/pod-netns-inbound/8080.sock
 ```
 
+**Descriptor lifetime is tracked.** `close` is intercepted so the supervisor
+drops its end of an injected socketpair and the table entry when the child is
+done with it, and both the descriptor table and the netns listener table are
+capped, so a program that leaks or sweeps sockets cannot grow the supervisor
+without bound.
+
 **`io_uring` is denied completely, not partially.** `io_uring_setup`,
 `io_uring_enter` and `io_uring_register` are all answered `EPERM`. A partial
 filter would be unsound: the kernel performs the submitted network operations
