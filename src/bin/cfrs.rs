@@ -182,11 +182,14 @@ fn cmd_tunnel(args: &[String]) -> Result<(), String> {
     options.print_qr = flags.present("qr");
     if let Some(secs) = flags.get("run-for") {
         options.run_for = Some(std::time::Duration::from_secs(
-            secs.parse().map_err(|_| "--run-for expects seconds".to_string())?,
+            secs.parse()
+                .map_err(|_| "--run-for expects seconds".to_string())?,
         ));
     }
     if let Some(auth) = flags.get("basic-auth") {
-        let (user, pass) = auth.split_once(':').ok_or("--basic-auth expects USER:PASS")?;
+        let (user, pass) = auth
+            .split_once(':')
+            .ok_or("--basic-auth expects USER:PASS")?;
         options.basic_auth = Some((user.to_string(), pass.to_string()));
     }
     if !flags.all("ip-allow").is_empty() {
@@ -195,7 +198,10 @@ fn cmd_tunnel(args: &[String]) -> Result<(), String> {
 
     let print_qr = options.print_qr;
     let tunnel = Tunnel::new(options);
-    eprintln!("cfrs: {} ingress rule(s) loaded", tunnel.router().rules().len());
+    eprintln!(
+        "cfrs: {} ingress rule(s) loaded",
+        tunnel.router().rules().len()
+    );
 
     // Reaching the edge is the step that decides whether a real Cloudflare
     // tunnel can run here. Say so plainly instead of hanging.
@@ -240,9 +246,7 @@ fn origin_from_flags(flags: &Flags) -> Result<Option<String>, String> {
         flags.get("unix-tls").map(|p| format!("unix+tls:{p}")),
         flags.get("tcp").map(|t| format!("tcp://{t}")),
         flags.get("dir").map(|d| format!("static:{d}")),
-        flags
-            .get("spa")
-            .map(|d| format!("spa:{d}")),
+        flags.get("spa").map(|d| format!("spa:{d}")),
         flags.get("status-code").map(|c| format!("http_status:{c}")),
         flags
             .present("hello-world")

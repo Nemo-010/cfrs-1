@@ -87,8 +87,7 @@ pub fn connect_tunnel_with_auth(
 /// Standard base64, written out so proxy auth and the WebSocket
 /// handshake key need no extra dependency.
 pub fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     for chunk in input.chunks(3) {
         let b = [
@@ -259,7 +258,10 @@ mod tests {
         // A partial header then EOF: the slice is exhausted on the next read.
         let mut raw: &[u8] = b"HTTP/1.1 200 Con";
         let err = read_connect_response(&mut raw).expect_err("truncated header must fail");
-        assert!(matches!(err.kind(), io::ErrorKind::UnexpectedEof), "got {err}");
+        assert!(
+            matches!(err.kind(), io::ErrorKind::UnexpectedEof),
+            "got {err}"
+        );
     }
 
     /// A real proxy exchange over a unix socket, so `connect_tunnel`'s socket

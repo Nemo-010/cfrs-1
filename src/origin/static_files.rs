@@ -44,7 +44,11 @@ impl StaticDir {
         writer: &mut W,
     ) -> std::io::Result<()> {
         let rel = req.path.trim_start_matches('/');
-        let rel = if rel.is_empty() { self.index.as_str() } else { rel };
+        let rel = if rel.is_empty() {
+            self.index.as_str()
+        } else {
+            rel
+        };
 
         match self.resolve(rel) {
             Some((path, is_dir)) => {
@@ -148,8 +152,13 @@ fn send_file<W: ResponseWriter>(
     // Honour a conditional request so a browser does not refetch unchanged
     // assets on every reload.
     if let (Some(inm), Some(mtime)) = (req.header("if-none-match"), meta.modified().ok()) {
-        let tag = format!("\"{}\"", mtime.duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0));
+        let tag = format!(
+            "\"{}\"",
+            mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
         if inm.split(',').any(|t| t.trim() == tag) {
             return writer
                 .status(304)
@@ -282,10 +291,7 @@ mod tests {
     }
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "cfrs-static-{}-{name}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("cfrs-static-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("mkdir");
         d
@@ -363,9 +369,15 @@ mod tests {
 
     #[test]
     fn content_types_cover_the_common_cases() {
-        assert_eq!(content_type(Path::new("a.html")), "text/html; charset=utf-8");
+        assert_eq!(
+            content_type(Path::new("a.html")),
+            "text/html; charset=utf-8"
+        );
         assert_eq!(content_type(Path::new("a.wasm")), "application/wasm");
-        assert_eq!(content_type(Path::new("a.unknownext")), "application/octet-stream");
+        assert_eq!(
+            content_type(Path::new("a.unknownext")),
+            "application/octet-stream"
+        );
     }
 
     #[test]

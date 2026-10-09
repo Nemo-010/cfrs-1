@@ -115,8 +115,12 @@ mod tests {
 
     #[test]
     fn a_missing_ca_file_is_reported_not_ignored() {
-        let err = client_config("example.com", false, Some(Path::new("/tmp/cfrs-no-such-ca.pem")))
-            .expect_err("missing ca must fail");
+        let err = client_config(
+            "example.com",
+            false,
+            Some(Path::new("/tmp/cfrs-no-such-ca.pem")),
+        )
+        .expect_err("missing ca must fail");
         assert!(err.contains("reading ca file"), "unexpected error: {err}");
     }
 

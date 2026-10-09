@@ -21,10 +21,13 @@ pub async fn connect(path: &std::path::Path, timeout: Duration) -> Result<(), St
 
 /// Whether a path looks like a usable unix socket right now.
 pub fn is_live(path: &std::path::Path) -> bool {
-    path.exists() && std::fs::metadata(path).map(|m| {
-        use std::os::unix::fs::FileTypeExt;
-        m.file_type().is_socket()
-    }).unwrap_or(false)
+    path.exists()
+        && std::fs::metadata(path)
+            .map(|m| {
+                use std::os::unix::fs::FileTypeExt;
+                m.file_type().is_socket()
+            })
+            .unwrap_or(false)
 }
 
 /// The `PathBuf` a service string should produce for `unix:`.

@@ -224,14 +224,21 @@ mod tests {
         assert_eq!(head.method, "GET");
         assert_eq!(head.path, "/hello?x=1");
         assert_eq!(head.header("host"), Some("example.com"));
-        assert_eq!(head.header("HOST"), Some("example.com"), "lookup is case-insensitive");
+        assert_eq!(
+            head.header("HOST"),
+            Some("example.com"),
+            "lookup is case-insensitive"
+        );
         assert_eq!(used, raw.len());
     }
 
     #[test]
     fn reports_incomplete_rather_than_malformed() {
         let raw = b"GET / HTTP/1.1\r\nHost: x\r\n";
-        assert_eq!(RequestHead::parse(raw).unwrap_err(), HttpParseError::Incomplete);
+        assert_eq!(
+            RequestHead::parse(raw).unwrap_err(),
+            HttpParseError::Incomplete
+        );
     }
 
     #[test]
@@ -274,7 +281,11 @@ mod tests {
         head.set_header("X-Real-IP", "1.2.3.4");
         assert_eq!(head.header("x-real-ip"), Some("1.2.3.4"));
         head.set_header("X-Real-IP", "5.6.7.8");
-        assert_eq!(head.header("x-real-ip"), Some("5.6.7.8"), "set must replace");
+        assert_eq!(
+            head.header("x-real-ip"),
+            Some("5.6.7.8"),
+            "set must replace"
+        );
         head.remove_header("X-Real-IP");
         assert_eq!(head.header("x-real-ip"), None);
     }
