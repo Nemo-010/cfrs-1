@@ -243,6 +243,7 @@ version = "0.2.0"
 dependencies = [
  "h2",
  "hickory-resolver",
+ "http",
  "libc",
  "qrcode",
  "quinn",

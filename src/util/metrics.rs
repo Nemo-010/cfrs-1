@@ -55,15 +55,45 @@ impl Metrics {
     pub fn render(&self) -> String {
         let mut out = String::new();
         let mut line = |name: &str, help: &str, value: u64| {
-            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"));
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+            ));
         };
-        line("cloudflared_tunnel_ha_connections", "registered edge connections", Self::get(&self.connections_registered));
-        line("cloudflared_tunnel_total_requests", "requests served", Self::get(&self.requests_served));
-        line("cloudflared_tunnel_request_errors", "request errors", Self::get(&self.stream_errors));
-        line("cloudflared_tunnel_response_bytes", "bytes sent to the edge", Self::get(&self.bytes_out));
-        line("cloudflared_tunnel_request_bytes", "bytes received from the edge", Self::get(&self.bytes_in));
-        line("cloudflared_tunnel_concurrent_streams_per_tunnel", "streams accepted", Self::get(&self.streams_total));
-        line("cloudflared_tunnel_server_locations", "reconnects", Self::get(&self.reconnects));
+        line(
+            "cloudflared_tunnel_ha_connections",
+            "registered edge connections",
+            Self::get(&self.connections_registered),
+        );
+        line(
+            "cloudflared_tunnel_total_requests",
+            "requests served",
+            Self::get(&self.requests_served),
+        );
+        line(
+            "cloudflared_tunnel_request_errors",
+            "request errors",
+            Self::get(&self.stream_errors),
+        );
+        line(
+            "cloudflared_tunnel_response_bytes",
+            "bytes sent to the edge",
+            Self::get(&self.bytes_out),
+        );
+        line(
+            "cloudflared_tunnel_request_bytes",
+            "bytes received from the edge",
+            Self::get(&self.bytes_in),
+        );
+        line(
+            "cloudflared_tunnel_concurrent_streams_per_tunnel",
+            "streams accepted",
+            Self::get(&self.streams_total),
+        );
+        line(
+            "cloudflared_tunnel_server_locations",
+            "reconnects",
+            Self::get(&self.reconnects),
+        );
         out
     }
 

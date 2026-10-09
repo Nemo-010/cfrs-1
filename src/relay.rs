@@ -256,7 +256,10 @@ impl AsyncWrite for PrefixedStream {
 /// is copied first, and only after the relay closes its sending side do we read
 /// the origin's response back. That is the same half-close ordering a browser
 /// uses for keep-alive requests.
-async fn splice_unix_socket(channel: Channel<Msg>, origin: &std::path::Path) -> std::io::Result<()> {
+async fn splice_unix_socket(
+    channel: Channel<Msg>,
+    origin: &std::path::Path,
+) -> std::io::Result<()> {
     let stream = UnixStream::connect(origin).await?;
     let (mut origin_reader, mut origin_writer) = tokio::io::split(stream);
     let (mut reader, mut writer) = tokio::io::split(channel.into_stream());
@@ -520,7 +523,10 @@ mod tests {
     fn default_config_targets_port_443() {
         // 443, not 22: the sandbox's egress proxy only allows 443.
         let cfg = RelayConfig::default();
-        assert!(cfg.address.ends_with(":443"), "default relay must be on 443");
+        assert!(
+            cfg.address.ends_with(":443"),
+            "default relay must be on 443"
+        );
     }
 
     #[test]
@@ -535,7 +541,10 @@ https://jcydy-2400-1a00-5b2f-821c-869e-56ff-fe03-2b71.run.pinggy-free.link\n";
             url,
             "https://blirg-2400-1a00-5b2f-821c-869e-56ff-fe03-2b71.free.pinggy.net"
         );
-        assert!(!url.contains("dashboard"), "dashboard must never be chosen: {url}");
+        assert!(
+            !url.contains("dashboard"),
+            "dashboard must never be chosen: {url}"
+        );
     }
 
     #[test]
@@ -572,7 +581,10 @@ https://jcydy-2400-1a00-5b2f-821c-869e-56ff-fe03-2b71.run.pinggy-free.link\n";
 
         // The relay writes the visitor's request, then reads the reply back.
         let relay_task = tokio::spawn(async move {
-            relay.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+            relay
+                .write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
             relay.shutdown().await.unwrap();
             let mut back = Vec::new();
             relay.read_to_end(&mut back).await.unwrap();
@@ -584,7 +596,10 @@ https://jcydy-2400-1a00-5b2f-821c-869e-56ff-fe03-2b71.run.pinggy-free.link\n";
         let origin_task = tokio::spawn(async move {
             let mut request = Vec::new();
             origin.read_to_end(&mut request).await.unwrap();
-            origin.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await.unwrap();
+            origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                .await
+                .unwrap();
             origin.shutdown().await.unwrap();
             request
         });

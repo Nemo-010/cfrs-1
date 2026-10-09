@@ -58,7 +58,10 @@ impl QuickTunnel {
     /// without any hashing step, so a reimplementation must not transform it.
     pub fn secret_bytes(&self) -> Result<Vec<u8>, String> {
         decode_base64(&self.secret).ok_or_else(|| {
-            format!("tunnel secret is not valid base64 ({} bytes of text)", self.secret.len())
+            format!(
+                "tunnel secret is not valid base64 ({} bytes of text)",
+                self.secret.len()
+            )
         })
     }
 }
@@ -130,14 +133,25 @@ impl std::fmt::Display for ProvisionError {
             ProvisionError::Status { code, body } => {
                 write!(f, "quick-tunnel service returned HTTP {code}: {body}")
             }
-            ProvisionError::Decode(e) => write!(f, "could not decode the quick-tunnel response: {e}"),
+            ProvisionError::Decode(e) => {
+                write!(f, "could not decode the quick-tunnel response: {e}")
+            }
             ProvisionError::Service(errs) => {
-                let joined: Vec<String> =
-                    errs.iter().map(|e| format!("{}: {}", e.code, e.message)).collect();
-                write!(f, "quick-tunnel service reported failure: {}", joined.join("; "))
+                let joined: Vec<String> = errs
+                    .iter()
+                    .map(|e| format!("{}: {}", e.code, e.message))
+                    .collect();
+                write!(
+                    f,
+                    "quick-tunnel service reported failure: {}",
+                    joined.join("; ")
+                )
             }
             ProvisionError::MissingResult => {
-                write!(f, "quick-tunnel service returned success with no result object")
+                write!(
+                    f,
+                    "quick-tunnel service returned success with no result object"
+                )
             }
         }
     }
@@ -172,8 +186,8 @@ pub fn request_quick_tunnel(
         return Err(ProvisionError::BadEndpoint(url));
     }
 
-    let mut builder = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(timeout_secs));
+    let mut builder =
+        ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(timeout_secs));
 
     if let Some(p) = proxy {
         let proxy_url = if p.starts_with("http://") || p.starts_with("https://") {
@@ -225,7 +239,10 @@ pub fn request_quick_tunnel(
 /// real responses without a live service.
 pub fn parse_quick_tunnel_response(status: u16, body: &str) -> Result<QuickTunnel, ProvisionError> {
     if !(200..300).contains(&status) {
-        return Err(ProvisionError::Status { code: status, body: body.to_string() });
+        return Err(ProvisionError::Status {
+            code: status,
+            body: body.to_string(),
+        });
     }
 
     let parsed: QuickTunnelResponse = serde_json::from_str(body)
@@ -235,9 +252,7 @@ pub fn parse_quick_tunnel_response(status: u16, body: &str) -> Result<QuickTunne
         return Err(ProvisionError::Service(parsed.errors));
     }
 
-    parsed
-        .result
-        .ok_or(ProvisionError::MissingResult)
+    parsed.result.ok_or(ProvisionError::MissingResult)
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -321,9 +336,16 @@ mod tests {
             tunnel.hostname,
             "operator-icon-sheffield-compression.trycloudflare.com"
         );
-        assert_eq!(tunnel.url(), "https://operator-icon-sheffield-compression.trycloudflare.com");
+        assert_eq!(
+            tunnel.url(),
+            "https://operator-icon-sheffield-compression.trycloudflare.com"
+        );
         assert_eq!(tunnel.id, "c1267064-5604-4d16-9a83-66b7ed37f182");
-        assert_eq!(tunnel.account_tag.len(), 32, "account tag is a 32-char hex string");
+        assert_eq!(
+            tunnel.account_tag.len(),
+            32,
+            "account tag is a 32-char hex string"
+        );
     }
 
     #[test]
@@ -348,12 +370,13 @@ mod tests {
             .expect("suffix checked above");
         assert!(!label.is_empty(), "there must be a leading label");
         assert!(
-            label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "the label must be ascii alphanumerics and hyphens: {label}"
         );
-        assert!(!tunnel.hostname.contains('/'), "hostname must not carry a scheme or path");
+        assert!(
+            !tunnel.hostname.contains('/'),
+            "hostname must not carry a scheme or path"
+        );
     }
 
     #[test]
@@ -402,16 +425,14 @@ mod tests {
 
     #[test]
     fn endpoint_must_be_an_absolute_http_url() {
-        let err =
-            request_quick_tunnel("ftp://example.com", AuthMode::Public, 5, None).unwrap_err();
+        let err = request_quick_tunnel("ftp://example.com", AuthMode::Public, 5, None).unwrap_err();
         assert!(matches!(err, ProvisionError::BadEndpoint(_)), "got {err:?}");
     }
 
     #[test]
     fn trailing_slash_on_the_endpoint_is_not_doubled() {
         // Guards the URL join: "https://host/" must become ".../tunnel", not "//tunnel".
-        let err =
-            request_quick_tunnel("not-a-url/", AuthMode::Public, 5, None).unwrap_err();
+        let err = request_quick_tunnel("not-a-url/", AuthMode::Public, 5, None).unwrap_err();
         match err {
             ProvisionError::BadEndpoint(url) => {
                 assert!(url.ends_with("/tunnel"), "unexpected url {url}");

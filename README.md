@@ -183,8 +183,11 @@ socket that nothing else can reach.
   For anything that must not be readable by a third party, run cfrs on a host
   that can reach port 7844 and point it at Cloudflare instead.
 - `cfrs provision` returns working edge credentials but does not open the edge
-  connection. That part of the protocol is not implemented; it is unreachable
-  from the sandbox this was built in, so it is untested rather than proven.
+  connection. Registration and visitor serving are not implemented. The HTTP/2
+  and QUIC transports build connections and frame messages, but nothing drives
+  them in a serving loop, so a `Tunnel` is configuration and routing rather than
+  a running tunnel. Port 7844 is unreachable from the sandbox this was built in,
+  so that part is untested rather than proven.
 - The relay's host-key check accepts any key. The relay is anonymous and
   ephemeral, but a deployment fronting sensitive traffic should pin one.
 
@@ -225,7 +228,16 @@ without binding a socket, which a sandbox may refuse to do.
 | `src/proxy.rs` | HTTP CONNECT transport, generic over `Read`/`Write` |
 | `src/quicktunnel.rs` | anonymous Cloudflare provisioning, no credentials |
 | `src/relay.rs` | SSH remote forward, splicing channels to a unix socket |
-| `src/bin/cfrs.rs` | CLI: `provision`, `serve`, `doctor` |
+| `src/cloudflare/mod.rs` | edge discovery, credentials, embedded edge roots |
+| `src/cloudflare/http2.rs` | HTTP/2 edge transport, header encoding, stream classification |
+| `src/cloudflare/quic.rs` | QUIC edge transport, ALPN and SNI, data-stream preamble |
+| `src/config.rs` | cloudflared-compatible YAML config and ingress rules |
+| `src/origin/` | TCP, unix-socket, static-file and SPA origins |
+| `src/transport/` | SSH and WebSocket relays |
+| `src/tunnel/mod.rs` | configuration, ingress routing, request preparation |
+| `src/feature/mod.rs` | QR rendering and the feature flag surface |
+| `src/util/` | HTTP head parsing, TLS helpers, metrics |
+| `src/bin/cfrs.rs` | CLI: `provision`, `serve`, `tunnel`, `metrics` |
 | `tools/cf-origin.rs` | test origin, serves over a unix socket with a marker |
 | `tools/prove-exposure.sh` | end-to-end proof, origin to public URL |
 

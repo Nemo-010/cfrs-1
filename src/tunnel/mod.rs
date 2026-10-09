@@ -17,13 +17,21 @@
 //! a thin wrapper over exactly what is exposed here, so anything the CLI can do
 //! is reachable from Rust without shelling out.
 //!
-//! # What happens where there is no reachable edge
+//! # What exists and what does not
 //!
-//! If the Cloudflare edge cannot be reached, [`Tunnel::run`] reports which
-//! transports it tried and why each failed rather than hanging. Falling back to
-//! an SSH or WebSocket relay is a separate, explicit transport choice, because
-//! a relay can see the traffic and that is a decision the operator should make,
-//! not a silent downgrade.
+//! [`Tunnel`] holds the configuration, the ingress router and the counters, and
+//! decides which origin serves a visitor. It does **not** open an edge
+//! connection: registration and visitor serving are not implemented, so a
+//! `Tunnel` is not yet a running Cloudflare tunnel. The transports that would
+//! carry it are in [`crate::cloudflare::http2`] and [`crate::cloudflare::quic`],
+//! which build the connections and frame the messages but are not yet driven by
+//! a serving loop.
+//!
+//! Edge discovery does report why the edge could not be reached rather than
+//! hanging: [`crate::cloudflare::discover_edges`] returns the resolver's error.
+//! Falling back to an SSH or WebSocket relay is a separate, explicit transport
+//! choice, because a relay can see the traffic and that is a decision the
+//! operator should make, not a silent downgrade.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +39,7 @@ use std::time::Duration;
 
 use crate::config::{Config, IngressRule, Router};
 use crate::origin::Origin;
-use crate::util::http::{RequestHead, strip_hop_by_hop};
+use crate::util::http::{strip_hop_by_hop, RequestHead};
 use crate::util::metrics::Metrics;
 
 /// How a tunnel should be built.
@@ -141,7 +149,11 @@ impl Tunnel {
     ///
     /// Returns `Ok(None)` when no rule matches, which the caller answers with a
     /// 404. Returning `Ok(Some)` picks a service with load balancing applied.
-    pub fn resolve(&mut self, host: &str, path: &str) -> Option<(usize, Origin, Option<crate::config::OriginRequest>)> {
+    pub fn resolve(
+        &mut self,
+        host: &str,
+        path: &str,
+    ) -> Option<(usize, Origin, Option<crate::config::OriginRequest>)> {
         let index = self.router.match_index(host, path)?;
         let service = self.router.select_service(index)?;
         let origin = service.origin().ok()?;
@@ -154,7 +166,11 @@ impl Tunnel {
     /// Hop-by-hop headers describe one connection rather than the message, so
     /// they are dropped before forwarding. A WebSocket upgrade must keep them,
     /// which is why the caller passes whether this is an upgrade.
-    pub fn prepare_request(head: &mut RequestHead, upgrade: bool, request: Option<&crate::config::OriginRequest>) {
+    pub fn prepare_request(
+        head: &mut RequestHead,
+        upgrade: bool,
+        request: Option<&crate::config::OriginRequest>,
+    ) {
         if !upgrade {
             strip_hop_by_hop(&mut head.headers);
         }
@@ -268,7 +284,11 @@ mod tests {
         let (_, origin, _) = t.resolve("api.example.com", "/x").expect("a route");
         assert_eq!(origin.kind(), "http");
         let (_, origin, _) = t.resolve("other.example.com", "/x").expect("a route");
-        assert_eq!(origin.kind(), "unix", "the catch-all serves the unix origin");
+        assert_eq!(
+            origin.kind(),
+            "unix",
+            "the catch-all serves the unix origin"
+        );
     }
 
     #[test]
@@ -292,8 +312,16 @@ mod tests {
                 hostname: None,
                 path: None,
                 services: vec![
-                    Service { service: "http://a:1".into(), weight: Some(1), enabled: None },
-                    Service { service: "http://b:2".into(), weight: Some(1), enabled: None },
+                    Service {
+                        service: "http://a:1".into(),
+                        weight: Some(1),
+                        enabled: None,
+                    },
+                    Service {
+                        service: "http://b:2".into(),
+                        weight: Some(1),
+                        enabled: None,
+                    },
                 ],
                 origin_request: None,
             }],

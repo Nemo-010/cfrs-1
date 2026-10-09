@@ -113,11 +113,7 @@ pub struct IngressRule {
     ///
     /// The YAML key is `service` (singular) because that is what cloudflared
     /// writes; the Rust field is plural because it holds a list.
-    #[serde(
-        rename = "service",
-        default,
-        deserialize_with = "de_services"
-    )]
+    #[serde(rename = "service", default, deserialize_with = "de_services")]
     pub services: Vec<Service>,
     /// Per-origin request tweaks, named as cloudflared names them.
     #[serde(
@@ -170,8 +166,7 @@ pub struct Service {
 impl Service {
     /// Parse a service string into an origin plus a service wrapper.
     pub fn parse(service: &str) -> Result<Service, ConfigError> {
-        Origin::parse(service)
-            .map_err(|e| ConfigError::Invalid(format!("{service:?}: {e}")))?;
+        Origin::parse(service).map_err(|e| ConfigError::Invalid(format!("{service:?}: {e}")))?;
         Ok(Service {
             service: service.to_string(),
             weight: None,
@@ -229,7 +224,11 @@ where
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OriginRequest {
     /// Skip TLS verification to the origin.
-    #[serde(rename = "noTLSVerify", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "noTLSVerify",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub no_tls_verify: Option<bool>,
     /// Override the `Host` header.
     #[serde(
@@ -269,10 +268,18 @@ pub struct OriginRequest {
 
     // Fields cfrs adds that cloudflared's originRequest does not have.
     /// Rewrite the incoming path to this prefix before forwarding.
-    #[serde(rename = "pathRewrite", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "pathRewrite",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub path_rewrite: Option<String>,
     /// Add these headers to the request sent to the origin.
-    #[serde(rename = "setHeaders", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "setHeaders",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub set_headers: Option<HashMap<String, String>>,
 }
 
@@ -336,8 +343,14 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
 /// Something that went wrong loading or validating a config.
 #[derive(Debug)]
 pub enum ConfigError {
-    Io { path: PathBuf, source: std::io::Error },
-    Yaml { path: PathBuf, message: String },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Yaml {
+        path: PathBuf,
+        message: String,
+    },
     Invalid(String),
 }
 
@@ -379,9 +392,9 @@ impl Router {
 
     /// Find the rule that handles a host and path.
     pub fn match_rule(&self, host: &str, path: &str) -> Option<&IngressRule> {
-        self.rules
-            .iter()
-            .find(|r| hostname_matches(r.hostname.as_deref(), host) && path_matches(r.path.as_deref(), path))
+        self.rules.iter().find(|r| {
+            hostname_matches(r.hostname.as_deref(), host) && path_matches(r.path.as_deref(), path)
+        })
     }
 
     /// Index of the matching rule, needed for balancing state.
@@ -426,10 +439,7 @@ impl Router {
 
         // Deterministic weighted round robin: advance a cursor by one and pick
         // the service whose cumulative weight contains it.
-        let cursor = self
-            .cursors
-            .entry(rule_index)
-            .or_insert(0);
+        let cursor = self.cursors.entry(rule_index).or_insert(0);
         *cursor = cursor.wrapping_add(1);
         let point = (*cursor % total as u64) as u32;
 
@@ -538,14 +548,17 @@ ingress:
   - service: http://127.0.0.1:9000
 "#;
         let cfg = Config::from_yaml(yaml).expect("parse");
-        assert_eq!(cfg.tunnel.as_deref(), Some("5a6b7c8d-0000-1111-2222-333344445555"));
+        assert_eq!(
+            cfg.tunnel.as_deref(),
+            Some("5a6b7c8d-0000-1111-2222-333344445555")
+        );
         assert_eq!(cfg.ha_connections, Some(4));
         assert_eq!(cfg.ingress.len(), 2);
-        assert_eq!(
-            cfg.ingress[0].hostname.as_deref(),
-            Some("api.example.com")
-        );
-        let or = cfg.ingress[0].origin_request.as_ref().expect("originRequest");
+        assert_eq!(cfg.ingress[0].hostname.as_deref(), Some("api.example.com"));
+        let or = cfg.ingress[0]
+            .origin_request
+            .as_ref()
+            .expect("originRequest");
         assert!(!or.verify_tls(), "noTLSVerify must disable verification");
         assert_eq!(or.http_host_header.as_deref(), Some("internal.example.com"));
         cfg.validate().expect("validate");
@@ -599,8 +612,14 @@ ingress:
 
     #[test]
     fn strips_a_port_from_the_host_before_matching() {
-        assert!(hostname_matches(Some("a.example.com"), "a.example.com:8443"));
-        assert!(hostname_matches(Some("*.example.com"), "api.example.com:443"));
+        assert!(hostname_matches(
+            Some("a.example.com"),
+            "a.example.com:8443"
+        ));
+        assert!(hostname_matches(
+            Some("*.example.com"),
+            "api.example.com:443"
+        ));
     }
 
     #[test]
@@ -609,7 +628,10 @@ ingress:
         assert!(path_matches(Some("/api"), "/api"));
         assert!(path_matches(Some("/api"), "/api/v1/things"));
         assert!(path_matches(Some("/api/"), "/api/v1"));
-        assert!(!path_matches(Some("/api"), "/apifoo"), "prefix must end on a boundary");
+        assert!(
+            !path_matches(Some("/api"), "/apifoo"),
+            "prefix must end on a boundary"
+        );
         assert!(path_matches(Some("/"), "/anything"));
     }
 
@@ -638,8 +660,16 @@ ingress:
             hostname: None,
             path: None,
             services: vec![
-                Service { service: "http://a:1".into(), weight: Some(3), enabled: None },
-                Service { service: "http://b:2".into(), weight: Some(1), enabled: None },
+                Service {
+                    service: "http://a:1".into(),
+                    weight: Some(3),
+                    enabled: None,
+                },
+                Service {
+                    service: "http://b:2".into(),
+                    weight: Some(1),
+                    enabled: None,
+                },
             ],
             origin_request: None,
         }]);
@@ -664,8 +694,16 @@ ingress:
             hostname: None,
             path: None,
             services: vec![
-                Service { service: "http://a:1".into(), weight: None, enabled: None },
-                Service { service: "http://b:2".into(), weight: None, enabled: None },
+                Service {
+                    service: "http://a:1".into(),
+                    weight: None,
+                    enabled: None,
+                },
+                Service {
+                    service: "http://b:2".into(),
+                    weight: None,
+                    enabled: None,
+                },
             ],
             origin_request: None,
         }]);
@@ -682,7 +720,11 @@ ingress:
         let mut r = Router::new(vec![IngressRule {
             hostname: None,
             path: None,
-            services: vec![Service { service: "http://a:1".into(), weight: None, enabled: None }],
+            services: vec![Service {
+                service: "http://a:1".into(),
+                weight: None,
+                enabled: None,
+            }],
             origin_request: None,
         }]);
         r.set_health(0, 0, false);
@@ -712,7 +754,11 @@ ingress:
         assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
         assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
         assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
-        assert_eq!(parse_duration("45"), Some(Duration::from_secs(45)), "bare means seconds");
+        assert_eq!(
+            parse_duration("45"),
+            Some(Duration::from_secs(45)),
+            "bare means seconds"
+        );
         assert_eq!(parse_duration("nonsense"), None);
         assert_eq!(parse_duration(""), None);
     }
@@ -732,7 +778,11 @@ ingress:
         };
         or.apply(&mut head);
         assert_eq!(head.header("Host"), Some("internal"));
-        assert_eq!(head.header("Accept-Encoding"), None, "must be stripped for streaming");
+        assert_eq!(
+            head.header("Accept-Encoding"),
+            None,
+            "must be stripped for streaming"
+        );
         assert_eq!(head.header("X-Cf"), Some("1"));
     }
 

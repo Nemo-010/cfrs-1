@@ -61,9 +61,7 @@ impl TcpOrigin {
         let addr = format!("{}:{}", self.host, self.port);
         let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| {
-                OriginError::Unreachable(format!("timed out connecting to {addr}"))
-            })?
+            .map_err(|_| OriginError::Unreachable(format!("timed out connecting to {addr}")))?
             .map_err(|e| OriginError::Unreachable(format!("{addr}: {e}")))?;
 
         // Nagle would add latency to the small request/response exchanges a
@@ -159,7 +157,6 @@ impl UnixOrigin {
         }
     }
 }
-
 
 /// Re-exported so the tunnel layer can split an [`OriginStream`] when it needs
 /// to copy in both directions at once.

@@ -22,8 +22,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Duplex, Transport, TransportError, TransportStream};
 
@@ -135,7 +135,9 @@ fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError
         None => (rest, "/"),
     };
     if authority.is_empty() {
-        return Err(TransportError::Unsupported("websocket url has no host".into()));
+        return Err(TransportError::Unsupported(
+            "websocket url has no host".into(),
+        ));
     }
 
     let (host, port) = match authority.rsplit_once(':') {
@@ -145,10 +147,7 @@ fn parse_ws_url(url: &str) -> Result<(bool, String, u16, String), TransportError
                 TransportError::Unsupported(format!("bad port in websocket url {url:?}"))
             })?,
         ),
-        None => (
-            authority.to_string(),
-            if secure { 443 } else { 80 },
-        ),
+        None => (authority.to_string(), if secure { 443 } else { 80 }),
     };
 
     Ok((secure, host, port, path.to_string()))
@@ -178,99 +177,99 @@ impl Transport for WebSocketTunnel {
         Box<dyn std::future::Future<Output = Result<TransportStream, TransportError>> + Send + 'a>,
     > {
         Box::pin(async move {
-        let (secure, url_host, url_port, path) = parse_ws_url(&self.url)?;
+            let (secure, url_host, url_port, path) = parse_ws_url(&self.url)?;
 
-        let tcp = super::Direct::new()
-            .connect(&url_host, url_port, timeout)
-            .await?;
-        let _ = host;
-        let _ = port;
+            let tcp = super::Direct::new()
+                .connect(&url_host, url_port, timeout)
+                .await?;
+            let _ = host;
+            let _ = port;
 
-        let key = ws_key().map_err(|_| {
-            TransportError::Handshake("no entropy for the websocket key".into())
-        })?;
+            let key = ws_key().map_err(|_| {
+                TransportError::Handshake("no entropy for the websocket key".into())
+            })?;
 
-        // TLS first when the URL is wss.
-        let stream: Box<dyn Duplex> = if secure {
-            let config = crate::util::tls::client_config(&url_host, false, None)
-                .map_err(|e| TransportError::Handshake(e))?;
-            let connector = tokio_rustls::TlsConnector::from(config);
-            let name = rustls_pki_types::ServerName::try_from(url_host.clone())
-                .map_err(|e| TransportError::Handshake(format!("bad server name: {e}")))?;
-            let connected = tokio::time::timeout(timeout, connector.connect(name, tcp))
-                .await
-                .map_err(|_| TransportError::Handshake("websocket TLS timed out".into()))?
-                .map_err(|e| TransportError::Handshake(format!("websocket TLS: {e}")))?;
-            Box::new(connected)
-        } else {
-            tcp
-        };
+            // TLS first when the URL is wss.
+            let stream: Box<dyn Duplex> = if secure {
+                let config = crate::util::tls::client_config(&url_host, false, None)
+                    .map_err(|e| TransportError::Handshake(e))?;
+                let connector = tokio_rustls::TlsConnector::from(config);
+                let name = rustls_pki_types::ServerName::try_from(url_host.clone())
+                    .map_err(|e| TransportError::Handshake(format!("bad server name: {e}")))?;
+                let connected = tokio::time::timeout(timeout, connector.connect(name, tcp))
+                    .await
+                    .map_err(|_| TransportError::Handshake("websocket TLS timed out".into()))?
+                    .map_err(|e| TransportError::Handshake(format!("websocket TLS: {e}")))?;
+                Box::new(connected)
+            } else {
+                tcp
+            };
 
-        let mut request = format!(
+            let mut request = format!(
             "GET {path} HTTP/1.1\r\nHost: {url_host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
         );
-        if let Some(o) = &self.origin {
-            request.push_str(&format!("Origin: {o}\r\n"));
-        }
-        for (k, v) in &self.headers {
-            request.push_str(&format!("{k}: {v}\r\n"));
-        }
-        request.push_str("\r\n");
-
-        // Split once: the request goes out on the write half while the
-        // response head comes back on the read half. Borrowing the same stream
-        // twice is not allowed, so the split is taken here.
-        let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
-
-        let head_bytes = tokio::time::timeout(timeout, async {
-            use tokio::io::AsyncWriteExt;
-            stream_writer.write_all(request.as_bytes()).await?;
-            stream_writer.flush().await?;
-
-            // Read the response head one byte at a time so nothing past the
-            // terminator is consumed: those bytes belong to the data stream.
-            let mut buf = Vec::with_capacity(512);
-            loop {
-                let mut byte = [0u8; 1];
-                if stream_reader.read(&mut byte).await? == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "closed during websocket handshake",
-                    ));
-                }
-                buf.push(byte[0]);
-                if buf.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-                if buf.len() > 16 * 1024 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "websocket handshake response too large",
-                    ));
-                }
+            if let Some(o) = &self.origin {
+                request.push_str(&format!("Origin: {o}\r\n"));
             }
-            Ok::<Vec<u8>, std::io::Error>(buf)
-        })
-        .await
-        .map_err(|_| TransportError::Handshake("websocket handshake timed out".into()))?
-        .map_err(|e| TransportError::Handshake(format!("websocket handshake: {e}")))?;
+            for (k, v) in &self.headers {
+                request.push_str(&format!("{k}: {v}\r\n"));
+            }
+            request.push_str("\r\n");
 
-        // A proxy or origin that does not upgrade would leave us with an HTTP
-        // response instead of a stream, so check the status line rather than
-        // discovering the problem as a confusing parse error later.
-        let head = String::from_utf8_lossy(&head_bytes);
-        let status = head.lines().next().unwrap_or_default();
-        if !status.contains(" 101 ") {
-            return Err(TransportError::Handshake(format!(
-                "expected 101 Switching Protocols, got {status:?}"
-            )));
-        }
+            // Split once: the request goes out on the write half while the
+            // response head comes back on the read half. Borrowing the same stream
+            // twice is not allowed, so the split is taken here.
+            let (mut stream_reader, mut stream_writer) = tokio::io::split(stream);
 
-        let leftover: Vec<u8> = Vec::new();
-        Ok(Box::new(Prefixed::new(
-            leftover,
-            Joined::new(stream_reader, stream_writer),
-        )) as TransportStream)
+            let head_bytes = tokio::time::timeout(timeout, async {
+                use tokio::io::AsyncWriteExt;
+                stream_writer.write_all(request.as_bytes()).await?;
+                stream_writer.flush().await?;
+
+                // Read the response head one byte at a time so nothing past the
+                // terminator is consumed: those bytes belong to the data stream.
+                let mut buf = Vec::with_capacity(512);
+                loop {
+                    let mut byte = [0u8; 1];
+                    if stream_reader.read(&mut byte).await? == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "closed during websocket handshake",
+                        ));
+                    }
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 16 * 1024 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "websocket handshake response too large",
+                        ));
+                    }
+                }
+                Ok::<Vec<u8>, std::io::Error>(buf)
+            })
+            .await
+            .map_err(|_| TransportError::Handshake("websocket handshake timed out".into()))?
+            .map_err(|e| TransportError::Handshake(format!("websocket handshake: {e}")))?;
+
+            // A proxy or origin that does not upgrade would leave us with an HTTP
+            // response instead of a stream, so check the status line rather than
+            // discovering the problem as a confusing parse error later.
+            let head = String::from_utf8_lossy(&head_bytes);
+            let status = head.lines().next().unwrap_or_default();
+            if !status.contains(" 101 ") {
+                return Err(TransportError::Handshake(format!(
+                    "expected 101 Switching Protocols, got {status:?}"
+                )));
+            }
+
+            let leftover: Vec<u8> = Vec::new();
+            Ok(Box::new(Prefixed::new(
+                leftover,
+                Joined::new(stream_reader, stream_writer),
+            )) as TransportStream)
         })
     }
 
@@ -465,7 +464,11 @@ mod tests {
         assert_eq!(frame.len(), 2 + 4 + 2);
         // The payload must decode once unmasked with the key.
         let key = &frame[2..6];
-        let unmasked: Vec<u8> = frame[6..].iter().enumerate().map(|(i, b)| b ^ key[i % 4]).collect();
+        let unmasked: Vec<u8> = frame[6..]
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 4])
+            .collect();
         assert_eq!(unmasked, b"hi");
     }
 
@@ -482,8 +485,9 @@ mod tests {
         for len in [0usize, 5, 125, 126, 300, 70000] {
             let payload = vec![0x5Au8; len];
             let frame = encode_frame(&payload, false, 0x2);
-            let (opcode, payload_len, total, masked) =
-                decode_frame_header(&frame).expect("decode").expect("complete");
+            let (opcode, payload_len, total, masked) = decode_frame_header(&frame)
+                .expect("decode")
+                .expect("complete");
             assert_eq!(opcode, 0x2, "opcode survives at len {len}");
             assert_eq!(payload_len, len, "payload length at len {len}");
             assert_eq!(total, frame.len(), "total length at len {len}");

@@ -58,7 +58,11 @@ pub enum Origin {
     /// Raw TCP, for non-HTTP protocols (ssh, rdp, database, game servers).
     Tcp { host: String, port: u16 },
     /// Serve a directory of files. The `static:` service.
-    Static { dir: PathBuf, spa: bool, index: String },
+    Static {
+        dir: PathBuf,
+        spa: bool,
+        index: String,
+    },
     /// Reply with a fixed status and no body. The `http_status:` service.
     Status { code: u16 },
     /// A canned hello-world page, matching cloudflared's `--hello-world`.
@@ -138,7 +142,9 @@ impl Origin {
 
         if let Some(rest) = s.strip_prefix("unix+tls:") {
             if rest.is_empty() {
-                return Err(OriginError::BadService("unix+tls: needs a socket path".into()));
+                return Err(OriginError::BadService(
+                    "unix+tls: needs a socket path".into(),
+                ));
             }
             return Ok(Origin::UnixTls {
                 path: PathBuf::from(rest),
@@ -230,25 +236,27 @@ impl Origin {
     /// Open a byte stream to this origin.
     pub async fn connect(&self, timeout: Duration) -> Result<OriginStream, OriginError> {
         match self {
-            Origin::Http { host, port } => {
-                TcpOrigin::new(host, *port).connect(timeout).await
-            }
+            Origin::Http { host, port } => TcpOrigin::new(host, *port).connect(timeout).await,
             Origin::Https {
                 host,
                 port,
                 insecure,
                 ca_file,
-            } => TcpOrigin::new_tls(host, *port, *insecure, ca_file.clone())
-                .connect(timeout)
-                .await,
+            } => {
+                TcpOrigin::new_tls(host, *port, *insecure, ca_file.clone())
+                    .connect(timeout)
+                    .await
+            }
             Origin::Unix { path } => UnixOrigin::new(path.clone()).connect(timeout).await,
             Origin::UnixTls {
                 path,
                 insecure,
                 ca_file,
-            } => UnixOrigin::new_tls(path.clone(), *insecure, ca_file.clone())
-                .connect(timeout)
-                .await,
+            } => {
+                UnixOrigin::new_tls(path.clone(), *insecure, ca_file.clone())
+                    .connect(timeout)
+                    .await
+            }
             Origin::Tcp { host, port } => TcpOrigin::new(host, *port).connect(timeout).await,
             // In-process origins are answered by the tunnel layer itself, not
             // dialled. Reporting them as such here keeps the data path honest.
@@ -399,8 +407,7 @@ mod tests {
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker =
-            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
         let mut cx = Context::from_waker(&waker);
         let mut fut = std::pin::pin!(fut);
         loop {

@@ -29,6 +29,7 @@ quinn = { version = "0.11", default-features = false, features = [
 ] }
 # HTTP/2 transport for the Cloudflare edge (SNI h2.cftunnel.com, empty ALPN).
 h2 = "0.4"
+http = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

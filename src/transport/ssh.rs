@@ -95,25 +95,29 @@ impl Transport for SshRelay {
         Box<dyn std::future::Future<Output = Result<TransportStream, TransportError>> + Send + 'a>,
     > {
         Box::pin(async move {
-        let (relay_host, relay_port) = self
-            .address
-            .rsplit_once(':')
-            .ok_or_else(|| {
-                TransportError::Unsupported(format!(
-                    "relay address must be host:port, got {:?}",
-                    self.address
-                ))
-            })
-            .and_then(|(h, p)| {
-                p.parse::<u16>().map(|port| (h.to_string(), port)).map_err(|_| {
-                    TransportError::Unsupported(format!("bad relay port in {:?}", self.address))
+            let (relay_host, relay_port) = self
+                .address
+                .rsplit_once(':')
+                .ok_or_else(|| {
+                    TransportError::Unsupported(format!(
+                        "relay address must be host:port, got {:?}",
+                        self.address
+                    ))
                 })
-            })?;
+                .and_then(|(h, p)| {
+                    p.parse::<u16>()
+                        .map(|port| (h.to_string(), port))
+                        .map_err(|_| {
+                            TransportError::Unsupported(format!(
+                                "bad relay port in {:?}",
+                                self.address
+                            ))
+                        })
+                })?;
 
-        // Reach the relay, through a proxy if one is configured.
-        let tcp: Box<dyn Duplex> = match &self.proxy {
-            None => {
-                Box::new(
+            // Reach the relay, through a proxy if one is configured.
+            let tcp: Box<dyn Duplex> = match &self.proxy {
+                None => Box::new(
                     tokio::net::TcpStream::connect((relay_host.as_str(), relay_port))
                         .await
                         .map_err(|e| {
@@ -121,79 +125,81 @@ impl Transport for SshRelay {
                                 "relay {relay_host}:{relay_port}: {e}"
                             ))
                         })?,
-                )
-            }
-            Some(proxy) => {
-                let proxy = proxy.clone();
-                let host = relay_host.clone();
-                let (stream, leftover) =
-                    tokio::task::spawn_blocking(move || {
+                ),
+                Some(proxy) => {
+                    let proxy = proxy.clone();
+                    let host = relay_host.clone();
+                    let (stream, leftover) = tokio::task::spawn_blocking(move || {
                         crate::proxy::connect_tunnel(&proxy, &host, relay_port, timeout)
                     })
                     .await
                     .map_err(|e| TransportError::Unreachable(format!("proxy task: {e}")))?
                     .map_err(|e| TransportError::Refused(format!("proxy: {e}")))?
                     .into_parts();
-                let _ = stream.set_nonblocking(true);
-                let stream = tokio::net::TcpStream::from_std(stream)
-                    .map_err(|e| TransportError::Unreachable(format!("wrap: {e}")))?;
-                Box::new(super::websocket::Prefixed::new(leftover, stream))
-            }
-        };
+                    let _ = stream.set_nonblocking(true);
+                    let stream = tokio::net::TcpStream::from_std(stream)
+                        .map_err(|e| TransportError::Unreachable(format!("wrap: {e}")))?;
+                    Box::new(super::websocket::Prefixed::new(leftover, stream))
+                }
+            };
 
-
-        let key = match &self.private_key {
-            Some(k) => Arc::clone(k),
-            None => Arc::new(
-                PrivateKey::random(&mut UnwrapErr(ssh_key::getrandom::SysRng), Algorithm::Ed25519)
+            let key = match &self.private_key {
+                Some(k) => Arc::clone(k),
+                None => Arc::new(
+                    PrivateKey::random(
+                        &mut UnwrapErr(ssh_key::getrandom::SysRng),
+                        Algorithm::Ed25519,
+                    )
                     .map_err(|e| TransportError::Handshake(format!("key generation: {e}")))?,
-            ),
-        };
+                ),
+            };
 
-        let mut config = Config::default();
-        config.inactivity_timeout = Some(Duration::from_secs(3600));
+            let mut config = Config::default();
+            config.inactivity_timeout = Some(Duration::from_secs(3600));
 
-        let client = Client {
-            accept_any_host_key: self.accept_any_host_key,
-        };
+            let client = Client {
+                accept_any_host_key: self.accept_any_host_key,
+            };
 
-        let mut handle = tokio::time::timeout(
-            timeout,
-            russh::client::connect_stream(Arc::new(config), tcp, client),
-        )
-        .await
-        .map_err(|_| TransportError::Handshake("ssh handshake timed out".into()))?
-        .map_err(|e| TransportError::Handshake(format!("ssh handshake: {e}")))?;
+            let mut handle = tokio::time::timeout(
+                timeout,
+                russh::client::connect_stream(Arc::new(config), tcp, client),
+            )
+            .await
+            .map_err(|_| TransportError::Handshake("ssh handshake timed out".into()))?
+            .map_err(|e| TransportError::Handshake(format!("ssh handshake: {e}")))?;
 
-        let auth = tokio::time::timeout(
-            timeout,
-            handle.authenticate_publickey(
-                self.username.clone(),
-                PrivateKeyWithHashAlg::new(key, None),
-            ),
-        )
-        .await
-        .map_err(|_| TransportError::Handshake("ssh auth timed out".into()))?
-        .map_err(|e| TransportError::Handshake(format!("ssh auth: {e}")))?;
-        if !auth.success() {
-            return Err(TransportError::Refused(format!(
-                "relay {} rejected the login",
-                self.address
-            )));
-        }
+            let auth = tokio::time::timeout(
+                timeout,
+                handle.authenticate_publickey(
+                    self.username.clone(),
+                    PrivateKeyWithHashAlg::new(key, None),
+                ),
+            )
+            .await
+            .map_err(|_| TransportError::Handshake("ssh auth timed out".into()))?
+            .map_err(|e| TransportError::Handshake(format!("ssh auth: {e}")))?;
+            if !auth.success() {
+                return Err(TransportError::Refused(format!(
+                    "relay {} rejected the login",
+                    self.address
+                )));
+            }
 
-        // Ask the relay to dial the destination for us.
-        let channel = tokio::time::timeout(
-            timeout,
-            handle.channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0),
-        )
-        .await
-        .map_err(|_| TransportError::Unreachable(format!("direct-tcpip to {host}:{port} timed out")))?
-        .map_err(|e| TransportError::Refused(format!("relay refused direct-tcpip: {e}")))?;
+            // Ask the relay to dial the destination for us.
+            let channel = tokio::time::timeout(
+                timeout,
+                handle.channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0),
+            )
+            .await
+            .map_err(|_| {
+                TransportError::Unreachable(format!("direct-tcpip to {host}:{port} timed out"))
+            })?
+            .map_err(|e| TransportError::Refused(format!("relay refused direct-tcpip: {e}")))?;
 
-        // The stream is a live SSH channel; wrapping it keeps the session alive
-        // for as long as the caller holds the stream.
-        Ok(Box::new(ChannelStream::new(handle, channel)) as TransportStream)
+            // The stream is a live SSH channel; wrapping it keeps the session alive
+            // for as long as the caller holds the stream.
+            Ok(Box::new(ChannelStream::new(handle, channel)) as TransportStream)
         })
     }
 
@@ -305,7 +311,10 @@ mod tests {
             Ok(_) => panic!("an unreachable relay must not connect"),
         };
         assert!(
-            matches!(err, TransportError::Unreachable(_) | TransportError::Refused(_)),
+            matches!(
+                err,
+                TransportError::Unreachable(_) | TransportError::Refused(_)
+            ),
             "expected a connection failure, got {err}"
         );
     }
@@ -322,7 +331,10 @@ mod tests {
             ..Default::default()
         };
         let text = format!("{t:?}");
-        assert!(!text.contains("PRIVATE"), "key material must not be formatted: {text}");
+        assert!(
+            !text.contains("PRIVATE"),
+            "key material must not be formatted: {text}"
+        );
         assert!(text.contains("free.pinggy.io"), "{text}");
     }
 }

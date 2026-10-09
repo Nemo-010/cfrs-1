@@ -108,59 +108,59 @@ impl Transport for Direct {
         Box<dyn std::future::Future<Output = Result<TransportStream, TransportError>> + Send + 'a>,
     > {
         Box::pin(async move {
-        // Try every resolved address rather than the first, so a host with both
-        // AAAA and A records still connects when only one family is routable.
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| {
-                TransportError::Unreachable(format!("cannot resolve {host}:{port}: {e}"))
-            })?
-            .collect();
+            // Try every resolved address rather than the first, so a host with both
+            // AAAA and A records still connects when only one family is routable.
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| {
+                    TransportError::Unreachable(format!("cannot resolve {host}:{port}: {e}"))
+                })?
+                .collect();
 
-        if addrs.is_empty() {
-            return Err(TransportError::Unreachable(format!(
-                "{host} resolved to no addresses"
-            )));
-        }
+            if addrs.is_empty() {
+                return Err(TransportError::Unreachable(format!(
+                    "{host} resolved to no addresses"
+                )));
+            }
 
-        let mut last: Option<std::io::Error> = None;
-        for addr in &addrs {
-            // Bind to a specific local address when one was configured, so a
-            // multi-homed host picks the interface cloudflared would.
-            let socket = match self.bind_address {
-                Some(bind) => {
-                    let socket = tokio::net::TcpSocket::new_v4().map_err(|e| {
-                        TransportError::Unreachable(format!("socket for {host}:{port}: {e}"))
-                    })?;
-                    socket.bind(bind).map_err(|e| {
-                        TransportError::Unreachable(format!("bind {bind}: {e}"))
-                    })?;
-                    socket
-                }
-                None => tokio::net::TcpSocket::new_v4().map_err(|e| {
-                    TransportError::Unreachable(format!("socket for {host}:{port}: {e}"))
-                })?,
-            };
-            match tokio::time::timeout(timeout, socket.connect(*addr)).await {
-                Ok(Ok(stream)) => {
-                    if self.no_delay {
-                        let _ = stream.set_nodelay(true);
+            let mut last: Option<std::io::Error> = None;
+            for addr in &addrs {
+                // Bind to a specific local address when one was configured, so a
+                // multi-homed host picks the interface cloudflared would.
+                let socket = match self.bind_address {
+                    Some(bind) => {
+                        let socket = tokio::net::TcpSocket::new_v4().map_err(|e| {
+                            TransportError::Unreachable(format!("socket for {host}:{port}: {e}"))
+                        })?;
+                        socket.bind(bind).map_err(|e| {
+                            TransportError::Unreachable(format!("bind {bind}: {e}"))
+                        })?;
+                        socket
                     }
-                    return Ok(Box::new(stream) as TransportStream);
-                }
-                Ok(Err(e)) => last = Some(e),
-                Err(_) => {
-                    return Err(TransportError::Unreachable(format!(
-                        "timed out connecting to {addr}"
-                    )))
+                    None => tokio::net::TcpSocket::new_v4().map_err(|e| {
+                        TransportError::Unreachable(format!("socket for {host}:{port}: {e}"))
+                    })?,
+                };
+                match tokio::time::timeout(timeout, socket.connect(*addr)).await {
+                    Ok(Ok(stream)) => {
+                        if self.no_delay {
+                            let _ = stream.set_nodelay(true);
+                        }
+                        return Ok(Box::new(stream) as TransportStream);
+                    }
+                    Ok(Err(e)) => last = Some(e),
+                    Err(_) => {
+                        return Err(TransportError::Unreachable(format!(
+                            "timed out connecting to {addr}"
+                        )))
+                    }
                 }
             }
-        }
 
-        Err(TransportError::Unreachable(format!(
-            "cannot connect to {host}:{port}{}",
-            last.map(|e| format!(": {e}")).unwrap_or_default()
-        )))
+            Err(TransportError::Unreachable(format!(
+                "cannot connect to {host}:{port}{}",
+                last.map(|e| format!(": {e}")).unwrap_or_default()
+            )))
         })
     }
 
@@ -210,28 +210,29 @@ impl Transport for HttpConnect {
         Box<dyn std::future::Future<Output = Result<TransportStream, TransportError>> + Send + 'a>,
     > {
         Box::pin(async move {
-        let tunnel = crate::proxy::connect_tunnel_with_auth(
-            &self.proxy_addr,
-            host,
-            port,
-            timeout,
-            self.credentials
-                .as_ref()
-                .map(|(u, p)| (u.as_str(), p.as_str())),
-        )
-        .map_err(|e| TransportError::Refused(format!("proxy {host}:{port}: {e}")))?;
+            let tunnel = crate::proxy::connect_tunnel_with_auth(
+                &self.proxy_addr,
+                host,
+                port,
+                timeout,
+                self.credentials
+                    .as_ref()
+                    .map(|(u, p)| (u.as_str(), p.as_str())),
+            )
+            .map_err(|e| TransportError::Refused(format!("proxy {host}:{port}: {e}")))?;
 
-        let (stream, leftover) = tunnel.into_parts();
-        stream
-            .set_nonblocking(true)
-            .map_err(|e| TransportError::Unreachable(format!("set nonblocking: {e}")))?;
-        let stream = tokio::net::TcpStream::from_std(stream)
-            .map_err(|e| TransportError::Unreachable(format!("wrap stream: {e}")))?;
-        // Bytes the proxy coalesced past the CONNECT response must be replayed
-        // before anything the peer sends, or the first read is short.
-        Ok(Box::new(crate::transport::websocket::Prefixed::new(
-            leftover, stream,
-        )) as TransportStream)
+            let (stream, leftover) = tunnel.into_parts();
+            stream
+                .set_nonblocking(true)
+                .map_err(|e| TransportError::Unreachable(format!("set nonblocking: {e}")))?;
+            let stream = tokio::net::TcpStream::from_std(stream)
+                .map_err(|e| TransportError::Unreachable(format!("wrap stream: {e}")))?;
+            // Bytes the proxy coalesced past the CONNECT response must be replayed
+            // before anything the peer sends, or the first read is short.
+            Ok(
+                Box::new(crate::transport::websocket::Prefixed::new(leftover, stream))
+                    as TransportStream,
+            )
         })
     }
 
@@ -320,7 +321,11 @@ mod tests {
             _port: u16,
             _timeout: Duration,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<TransportStream, TransportError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<TransportStream, TransportError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let msg = self.1.to_string();
             Box::pin(async move { Err(TransportError::Refused(msg)) })
@@ -341,7 +346,11 @@ mod tests {
             _port: u16,
             _timeout: Duration,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<TransportStream, TransportError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<TransportStream, TransportError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             Box::pin(async move {
                 let (a, _b) = tokio::io::duplex(64);
@@ -396,7 +405,11 @@ mod tests {
     async fn direct_reports_an_unresolvable_host() {
         let d = Direct::new();
         let err = match d
-            .connect("this-host-does-not-exist.invalid", 443, Duration::from_millis(500))
+            .connect(
+                "this-host-does-not-exist.invalid",
+                443,
+                Duration::from_millis(500),
+            )
             .await
         {
             Err(e) => e,

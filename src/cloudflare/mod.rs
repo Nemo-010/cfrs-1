@@ -30,8 +30,12 @@
 //! goes on the wire verbatim, as `TunnelAuth.tunnelSecret`; it is not hashed or
 //! otherwise transformed.
 
+pub mod http2;
+pub mod quic;
+
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::time::Duration;
 
 /// ALPN for the QUIC transport.
@@ -131,10 +135,7 @@ impl Credentials {
 fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
-        return Err(format!(
-            "tunnel id {:?} is not a 32-character uuid",
-            s
-        ));
+        return Err(format!("tunnel id {:?} is not a 32-character uuid", s));
     }
     let mut out = [0u8; 16];
     for i in 0..16 {
@@ -246,9 +247,7 @@ pub fn edge_tls_config(alpn: &[u8]) -> Result<Arc<rustls::ClientConfig>, String>
     }
 
     let builder = rustls::ClientConfig::builder();
-    let mut config = builder
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
     config.alpn_protocols = if alpn.is_empty() {
         Vec::new()
     } else {
@@ -277,10 +276,7 @@ mod tests {
     #[test]
     fn the_data_stream_preamble_matches_the_source() {
         // From tunnelrpc/quic/protocol.go: dataStreamProtocolSignature.
-        assert_eq!(
-            DATA_STREAM_SIGNATURE,
-            [0x0A, 0x36, 0xCD, 0x12, 0xA1, 0x3E]
-        );
+        assert_eq!(DATA_STREAM_SIGNATURE, [0x0A, 0x36, 0xCD, 0x12, 0xA1, 0x3E]);
         assert_eq!(DATA_STREAM_VERSION, b"01");
     }
 
@@ -308,8 +304,7 @@ mod tests {
 
     #[test]
     fn uuids_parse_to_their_sixteen_bytes() {
-        let bytes =
-            parse_uuid("c1267064-5604-4d16-9a83-66b7ed37f182").expect("valid uuid");
+        let bytes = parse_uuid("c1267064-5604-4d16-9a83-66b7ed37f182").expect("valid uuid");
         assert_eq!(bytes[0], 0xc1);
         assert_eq!(bytes[15], 0x82);
         assert_eq!(bytes.len(), 16);

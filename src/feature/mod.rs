@@ -338,7 +338,8 @@ impl DenyReason {
     pub fn message(&self) -> String {
         match self {
             DenyReason::IpDenied(_) => {
-                "403 forbidden: this tunnel does not accept requests from your address\n".to_string()
+                "403 forbidden: this tunnel does not accept requests from your address\n"
+                    .to_string()
             }
             DenyReason::CredentialsMissing { challenge } => {
                 format!("401 unauthorized: this tunnel requires authentication ({challenge})\n")
@@ -485,7 +486,11 @@ impl HttpBasicAuth {
         let Ok(text) = String::from_utf8(decoded) else {
             return Err(DenyReason::CredentialsInvalid);
         };
-        if self.entries.iter().any(|e| constant_time_eq(e.as_bytes(), text.as_bytes())) {
+        if self
+            .entries
+            .iter()
+            .any(|e| constant_time_eq(e.as_bytes(), text.as_bytes()))
+        {
             Ok(())
         } else {
             Err(DenyReason::CredentialsInvalid)
@@ -559,7 +564,10 @@ impl AccessController {
     /// check comes last: it describes *this* endpoint, and an unauthorised
     /// caller learns nothing from it.
     pub fn authorize(&self, req: &RequestHead, remote: &IpAddr) -> AccessDecision {
-        if !matches!(req.method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH") {
+        if !matches!(
+            req.method.as_str(),
+            "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH"
+        ) {
             return AccessDecision::refusal(&DenyReason::MethodNotAllowed(format!(
                 "{} is not accepted here",
                 req.method
@@ -712,8 +720,9 @@ impl MetricsEndpoint {
         // because something else put it there and deleting it is not ours to do.
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_socket() => {
-                std::fs::remove_file(path)
-                    .map_err(|e| FeatureError::io(format!("remove stale socket {}", path.display()), e))?;
+                std::fs::remove_file(path).map_err(|e| {
+                    FeatureError::io(format!("remove stale socket {}", path.display()), e)
+                })?;
             }
             Ok(_) => {
                 return Err(FeatureError::Invalid(format!(
@@ -722,9 +731,7 @@ impl MetricsEndpoint {
                 )))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(FeatureError::io(format!("stat {}", path.display()), e))
-            }
+            Err(e) => return Err(FeatureError::io(format!("stat {}", path.display()), e)),
         }
 
         let listener = tokio::net::UnixListener::bind(path)
@@ -766,7 +773,10 @@ impl MetricsEndpoint {
                     ) {
                         continue;
                     }
-                    return Err(FeatureError::io("accept on the metrics socket".to_string(), e));
+                    return Err(FeatureError::io(
+                        "accept on the metrics socket".to_string(),
+                        e,
+                    ));
                 }
             };
 
@@ -820,7 +830,12 @@ async fn serve_metrics_connection(
         Ok((head, _)) => metrics_response(&head, &metrics),
         // A truncated head is the client's business, not the server's; 400 is
         // the honest answer and it is what a metrics client logs on failure.
-        Err(_) => crate::util::http::build_response(400, "Bad Request", &[], Some(b"incomplete request\n")),
+        Err(_) => crate::util::http::build_response(
+            400,
+            "Bad Request",
+            &[],
+            Some(b"incomplete request\n"),
+        ),
     };
 
     write_half
@@ -1141,7 +1156,10 @@ impl StaticServer {
             ("X-Frame-Options", "SAMEORIGIN"),
             ("Referrer-Policy", "no-referrer"),
             ("Cross-Origin-Opener-Policy", "same-origin"),
-            ("Content-Security-Policy", "default-src 'self'; frame-ancestors 'self'"),
+            (
+                "Content-Security-Policy",
+                "default-src 'self'; frame-ancestors 'self'",
+            ),
         ]
     }
 
@@ -1262,21 +1280,17 @@ impl ShareLink {
                 "{trimmed:?} has an empty authority"
             )));
         }
-        let authority = rest
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_string();
         if authority.is_empty() {
-            return Err(FeatureError::Invalid(format!(
-                "{trimmed:?} has no host"
-            )));
+            return Err(FeatureError::Invalid(format!("{trimmed:?} has no host")));
         }
         // Strip any port before looking for credentials, so a bracketed IPv6
         // literal's own colons are not mistaken for a userinfo separator.
         let host = authority
             .rsplit_once(':')
-            .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && !h.ends_with(']'))
+            .filter(|(h, p)| {
+                !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && !h.ends_with(']')
+            })
             .map_or(authority.clone(), |(h, _)| h.to_string());
         if host.contains('@') {
             return Err(FeatureError::Invalid(format!(
@@ -1292,7 +1306,9 @@ impl ShareLink {
     }
 
     /// Build from a provisioned quick tunnel.
-    pub fn from_quick_tunnel(tunnel: &crate::quicktunnel::QuickTunnel) -> Result<Self, FeatureError> {
+    pub fn from_quick_tunnel(
+        tunnel: &crate::quicktunnel::QuickTunnel,
+    ) -> Result<Self, FeatureError> {
         ShareLink::new(&tunnel.url(), ShareSource::QuickTunnel)
     }
 
@@ -1369,7 +1385,10 @@ impl ShareLink {
     /// reopened with no network at all.
     pub fn html(&self) -> Result<String, FeatureError> {
         let qr = self.qr()?;
-        let note = self.note.as_deref().map(|n| format!("<p>{}</p>", html_escape(n)));
+        let note = self
+            .note
+            .as_deref()
+            .map(|n| format!("<p>{}</p>", html_escape(n)));
         Ok(format!(
             "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -1465,7 +1484,10 @@ mod tests {
         let decision = c.authorize(&req("GET", "/"), &ip);
         assert_eq!(status_line(&decision.to_bytes()), 403);
         let text = String::from_utf8(decision.to_bytes()).expect("utf8");
-        assert!(!text.contains("WWW-Authenticate"), "leaked a challenge: {text}");
+        assert!(
+            !text.contains("WWW-Authenticate"),
+            "leaked a challenge: {text}"
+        );
     }
 
     #[test]
@@ -1477,7 +1499,10 @@ mod tests {
         assert!(c.authorize(&req("GET", "/"), &inside).is_allowed());
 
         let outside: IpAddr = "192.0.2.7".parse().expect("parse");
-        assert_eq!(status_line(&c.authorize(&req("GET", "/"), &outside).to_bytes()), 403);
+        assert_eq!(
+            status_line(&c.authorize(&req("GET", "/"), &outside).to_bytes()),
+            403
+        );
     }
 
     #[test]
@@ -1511,13 +1536,24 @@ mod tests {
         assert!(v4.contains(&"8.8.8.8".parse().expect("parse")));
         assert!(!v4.contains(&"::1".parse().expect("parse")));
         // /0 is the whole family, which is what `AccessController::closed` uses.
-        assert!(IpRange::parse("0.0.0.0/0").expect("parse").contains(&"1.2.3.4".parse().expect("parse")));
-        assert!(IpRange::parse("2001:db8::1").expect("parse").contains(&"2001:db8::1".parse().expect("parse")));
+        assert!(IpRange::parse("0.0.0.0/0")
+            .expect("parse")
+            .contains(&"1.2.3.4".parse().expect("parse")));
+        assert!(IpRange::parse("2001:db8::1")
+            .expect("parse")
+            .contains(&"2001:db8::1".parse().expect("parse")));
     }
 
     #[test]
     fn bad_address_specifications_are_rejected_rather_than_defaulting_open() {
-        for bad in ["", "not-an-ip", "10.0.0.0/33", "10.0.0.0/-1", "10.0.0.0/x", "999.1.1.1"] {
+        for bad in [
+            "",
+            "not-an-ip",
+            "10.0.0.0/33",
+            "10.0.0.0/-1",
+            "10.0.0.0/x",
+            "999.1.1.1",
+        ] {
             assert!(
                 IpRange::parse(bad).is_err(),
                 "{bad:?} must not parse into an allow rule"
@@ -1554,7 +1590,7 @@ mod tests {
             "Basic YWxpY2U6d3Jvbmc=", // alice:wrong
             "Basic !!!not base64!!!",
             "Bearer sometoken",
-            "Basic ",                   // nothing after the scheme
+            "Basic ", // nothing after the scheme
         ] {
             let decision = c.authorize(&req_with_auth("/", header), &ip);
             assert_eq!(
@@ -1590,14 +1626,19 @@ mod tests {
             .collect();
         let refs: Vec<&str> = too_many.iter().map(String::as_str).collect();
         let mut too_many_controller = AccessController::open();
-        assert!(too_many_controller.require_basic_auth("cfrs", &refs).is_err());
+        assert!(too_many_controller
+            .require_basic_auth("cfrs", &refs)
+            .is_err());
     }
 
     #[test]
     fn an_unknown_method_is_405_and_a_known_one_is_not() {
         let c = AccessController::open();
         let ip: IpAddr = "203.0.113.1".parse().expect("parse");
-        assert_eq!(status_line(&c.authorize(&req("TRACE", "/"), &ip).to_bytes()), 405);
+        assert_eq!(
+            status_line(&c.authorize(&req("TRACE", "/"), &ip).to_bytes()),
+            405
+        );
         for method in ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"] {
             assert!(
                 c.authorize(&req(method, "/"), &ip).is_allowed(),
@@ -1610,10 +1651,14 @@ mod tests {
     fn ip_rules_round_trip_through_their_text_form() {
         let mut f = IpFilter::allow_all();
         f.deny_str("203.0.113.5").expect("deny single");
-        f.allow_str("office", "198.51.100.0/24").expect("allow block");
+        f.allow_str("office", "198.51.100.0/24")
+            .expect("allow block");
         assert_eq!(f.len(), 2);
         let described = f.describe();
-        assert!(described.contains("allow office 198.51.100.0/24"), "{described}");
+        assert!(
+            described.contains("allow office 198.51.100.0/24"),
+            "{described}"
+        );
         assert!(described.contains("deny 203.0.113.5"), "{described}");
 
         // Deny wins over allow for the same address.
@@ -1627,7 +1672,10 @@ mod tests {
         let c = AccessController::closed();
         let ip: IpAddr = "203.0.113.9".parse().expect("parse");
         assert!(!c.is_open());
-        assert_eq!(status_line(&c.authorize(&req("GET", "/"), &ip).to_bytes()), 403);
+        assert_eq!(
+            status_line(&c.authorize(&req("GET", "/"), &ip).to_bytes()),
+            403
+        );
     }
 
     // -- metrics -----------------------------------------------------------
@@ -1640,20 +1688,28 @@ mod tests {
         let text = String::from_utf8(bytes).expect("utf8");
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
         assert!(text.contains("text/plain; version=0.0.4"), "{text}");
-        assert!(text.contains("cloudflared_tunnel_concurrent_streams_per_tunnel 1"), "{text}");
+        assert!(
+            text.contains("cloudflared_tunnel_concurrent_streams_per_tunnel 1"),
+            "{text}"
+        );
     }
 
     #[test]
     fn the_metrics_endpoint_answers_a_query_string_and_refuses_writes() {
         let m = Metrics::new();
         // A scraper appends a cache-buster; the path must match without it.
-        assert!(String::from_utf8(metrics_response(&req("GET", "/metrics?x=1"), &m))
-            .expect("utf8")
-            .starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            String::from_utf8(metrics_response(&req("GET", "/metrics?x=1"), &m))
+                .expect("utf8")
+                .starts_with("HTTP/1.1 200 OK")
+        );
 
         let wrote = metrics_response(&req("POST", METRICS_PATH), &m);
         let text = String::from_utf8(wrote).expect("utf8");
-        assert!(text.starts_with("HTTP/1.1 405 Method Not Allowed"), "{text}");
+        assert!(
+            text.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{text}"
+        );
         assert!(text.contains("Allow: GET, HEAD"), "{text}");
     }
 
@@ -1671,7 +1727,8 @@ mod tests {
         let m = Metrics::new();
         Metrics::add(&m.bytes_in, 4096);
 
-        let path = std::env::temp_dir().join(format!("cfrs-feature-metrics-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("cfrs-feature-metrics-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let endpoint = MetricsEndpoint::bind(&path, m).await.expect("bind");
@@ -1679,7 +1736,9 @@ mod tests {
         assert_eq!(bound, path, "the bound address is the only way in");
 
         let server = tokio::spawn(endpoint.serve());
-        let mut client = tokio::net::UnixStream::connect(&bound).await.expect("connect");
+        let mut client = tokio::net::UnixStream::connect(&bound)
+            .await
+            .expect("connect");
 
         client
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1691,7 +1750,10 @@ mod tests {
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
         // The counter set by the test must be visible over the wire.
-        assert!(text.contains("cloudflared_tunnel_request_bytes 4096"), "{text}");
+        assert!(
+            text.contains("cloudflared_tunnel_request_bytes 4096"),
+            "{text}"
+        );
 
         server.abort();
         let _ = std::fs::remove_file(&path);
@@ -1718,10 +1780,13 @@ mod tests {
 
     #[tokio::test]
     async fn binding_replaces_a_stale_socket_left_by_a_crash() {
-        let path = std::env::temp_dir().join(format!("cfrs-feature-stale-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("cfrs-feature-stale-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let first = MetricsEndpoint::bind(&path, Metrics::new()).await.expect("first bind");
+        let first = MetricsEndpoint::bind(&path, Metrics::new())
+            .await
+            .expect("first bind");
         assert!(path.exists());
         drop(first);
 
@@ -1749,10 +1814,18 @@ mod tests {
         let expected_cols = code.width() + 8;
         assert_eq!(lines[0].chars().count(), expected_cols, "row width");
         // Blocks draws two lines per module row.
-        assert_eq!(lines.len(), expected_cols * 2, "Blocks is square on a 1:2 cell");
+        assert_eq!(
+            lines.len(),
+            expected_cols * 2,
+            "Blocks is square on a 1:2 cell"
+        );
 
         for line in &lines {
-            assert_eq!(line.chars().count(), expected_cols, "every row is the same width");
+            assert_eq!(
+                line.chars().count(),
+                expected_cols,
+                "every row is the same width"
+            );
         }
 
         // The quiet zone must be light on all four sides, or a scanner loses
@@ -1776,15 +1849,15 @@ mod tests {
             .expect("encode");
         let cols = code.width() + 8;
 
-        for (style, rows_per_module) in [(QrStyle::Blocks, 2), (QrStyle::Ascii, 1), (QrStyle::Unicode, 1)] {
+        for (style, rows_per_module) in [
+            (QrStyle::Blocks, 2),
+            (QrStyle::Ascii, 1),
+            (QrStyle::Unicode, 1),
+        ] {
             let out = render_qr_with(data, style, qrcode::EcLevel::L).expect("render");
             let lines: Vec<&str> = out.lines().collect();
             assert_eq!(lines[0].chars().count(), cols, "{style:?} width");
-            assert_eq!(
-                lines.len(),
-                cols * rows_per_module,
-                "{style:?} height"
-            );
+            assert_eq!(lines.len(), cols * rows_per_module, "{style:?} height");
         }
 
         // Blocks is the tall, square one; Ascii is the compact one.
@@ -1835,7 +1908,10 @@ mod tests {
             !qr_fits(long, 40).expect("fits long"),
             "a wide symbol must be reported as not fitting a narrow terminal"
         );
-        assert!(qr_fits(short, 1).is_ok(), "a narrow terminal is an answer, not an error");
+        assert!(
+            qr_fits(short, 1).is_ok(),
+            "a narrow terminal is an answer, not an error"
+        );
     }
 
     // -- static serving ----------------------------------------------------
@@ -1845,7 +1921,8 @@ mod tests {
         let d = tmpdir("static-file");
         std::fs::write(d.join("index.html"), b"<h1>hello</h1>").expect("write");
 
-        let origin = crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
+        let origin =
+            crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
         let server = StaticServer::from_origin(&origin).expect("from origin");
 
         let resp = server.respond(&req("GET", "/")).expect("respond");
@@ -1853,7 +1930,10 @@ mod tests {
         assert_eq!(resp.body, b"<h1>hello</h1>");
         assert_eq!(resp.header_value("x-content-type-options"), Some("nosniff"));
         assert_eq!(resp.header_value("x-frame-options"), Some("SAMEORIGIN"));
-        assert!(resp.header_value("content-type").expect("type").starts_with("text/html"));
+        assert!(resp
+            .header_value("content-type")
+            .expect("type")
+            .starts_with("text/html"));
 
         // The buffered response must render as a real HTTP response.
         let bytes = String::from_utf8(resp.to_bytes()).expect("utf8");
@@ -1875,7 +1955,8 @@ mod tests {
         // protection as the file it failed to serve.
         let d = tmpdir("static-missing");
         std::fs::write(d.join("index.html"), b"x").expect("write");
-        let origin = crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
+        let origin =
+            crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
         let resp = StaticServer::from_origin(&origin)
             .expect("from origin")
             .respond(&req("GET", "/nope"))
@@ -1893,7 +1974,8 @@ mod tests {
         let secret = d.join("..").join("cfrs-feature-secret");
         std::fs::write(&secret, b"SECRET").expect("write secret");
 
-        let origin = crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
+        let origin =
+            crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
         let server = StaticServer::from_origin(&origin).expect("from origin");
         for attack in ["/../cfrs-feature-secret", "/%2e%2e/cfrs-feature-secret"] {
             let resp = server.respond(&req("GET", attack)).expect("respond");
@@ -1910,7 +1992,8 @@ mod tests {
     fn a_write_method_is_refused_by_the_static_server() {
         let d = tmpdir("static-write");
         std::fs::write(d.join("index.html"), b"index").expect("write");
-        let origin = crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
+        let origin =
+            crate::origin::Origin::parse(&format!("static:{}", d.display())).expect("parse");
         let server = StaticServer::from_origin(&origin).expect("from origin");
 
         let resp = server.respond(&req("POST", "/")).expect("respond");
@@ -1953,7 +2036,11 @@ mod tests {
         b.text("hi").expect("write body");
         assert!(b.is_started());
         assert_eq!(b.status, 201);
-        assert_eq!(b.header_value("x-test"), Some("1"), "lookup is case-insensitive");
+        assert_eq!(
+            b.header_value("x-test"),
+            Some("1"),
+            "lookup is case-insensitive"
+        );
         assert_eq!(b.body, b"hi");
         assert!(String::from_utf8(b.to_bytes())
             .expect("utf8")
@@ -1964,10 +2051,17 @@ mod tests {
 
     #[test]
     fn a_valid_url_is_accepted_and_its_host_reported() {
-        let link = ShareLink::new("https://foo-bar.trycloudflare.com/", ShareSource::QuickTunnel)
-            .expect("valid");
+        let link = ShareLink::new(
+            "https://foo-bar.trycloudflare.com/",
+            ShareSource::QuickTunnel,
+        )
+        .expect("valid");
         assert_eq!(link.url(), "https://foo-bar.trycloudflare.com/");
-        assert_eq!(link.host(), "foo-bar.trycloudflare.com", "the host drops path and scheme");
+        assert_eq!(
+            link.host(),
+            "foo-bar.trycloudflare.com",
+            "the host drops path and scheme"
+        );
         assert_eq!(link.source(), ShareSource::QuickTunnel);
         assert_eq!(link.source().label(), "quick tunnel");
     }
@@ -1976,10 +2070,7 @@ mod tests {
     fn a_url_with_credentials_is_refused_rather_than_shared() {
         // This is the case the type exists for: the browser accepts it, so
         // nothing else would ever complain, and pasting it shares the password.
-        for bad in [
-            "https://user:pass@example.com",
-            "https://user@example.com",
-        ] {
+        for bad in ["https://user:pass@example.com", "https://user@example.com"] {
             let err = ShareLink::new(bad, ShareSource::Manual).expect_err("credentials");
             match err {
                 FeatureError::Invalid(m) => assert!(m.contains("credentials"), "{m}"),
@@ -2011,27 +2102,33 @@ mod tests {
     fn an_ipv6_literal_url_keeps_its_brackets_and_is_accepted() {
         // A colon-separated IPv6 host would be mistaken for a userinfo
         // separator unless the port is split off first.
-        let link = ShareLink::new("http://[2001:db8::1]:8080/", ShareSource::Manual)
-            .expect("ipv6 url");
+        let link =
+            ShareLink::new("http://[2001:db8::1]:8080/", ShareSource::Manual).expect("ipv6 url");
         assert_eq!(link.host(), "[2001:db8::1]:8080");
         assert_eq!(link.url(), "http://[2001:db8::1]:8080/");
     }
 
     #[test]
     fn the_share_page_is_self_contained_and_escapes_the_note() {
-        let link = ShareLink::new(
-            "https://foo.trycloudflare.com",
-            ShareSource::QuickTunnel,
-        )
-        .expect("valid")
-        .with_note("<script>alert(1)</script> & co");
+        let link = ShareLink::new("https://foo.trycloudflare.com", ShareSource::QuickTunnel)
+            .expect("valid")
+            .with_note("<script>alert(1)</script> & co");
 
         let page = link.html().expect("html");
         assert!(page.starts_with("<!DOCTYPE html>"), "must be a document");
-        assert!(page.contains("https://foo.trycloudflare.com"), "the link must be present");
+        assert!(
+            page.contains("https://foo.trycloudflare.com"),
+            "the link must be present"
+        );
         // No external reference of any kind: nothing to fetch when offline.
-        assert!(!page.contains("http://"), "the page must not fetch anything");
-        assert!(!page.contains("<script>"), "the note must be escaped: {page}");
+        assert!(
+            !page.contains("http://"),
+            "the page must not fetch anything"
+        );
+        assert!(
+            !page.contains("<script>"),
+            "the note must be escaped: {page}"
+        );
         assert!(page.contains("&lt;script&gt;"), "{page}");
         assert!(page.contains("&amp;"), "{page}");
     }
@@ -2043,7 +2140,10 @@ mod tests {
             .with_note("dev server");
         let text = link.terminal();
         let first = text.lines().next().expect("a line");
-        assert_eq!(first, "https://foo.trycloudflare.com", "the URL must be copyable first");
+        assert_eq!(
+            first, "https://foo.trycloudflare.com",
+            "the URL must be copyable first"
+        );
         assert!(text.contains("// dev server"));
         assert!(text.contains("ssh relay"));
     }

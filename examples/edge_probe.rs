@@ -42,10 +42,7 @@ struct Client;
 impl Handler for Client {
     type Error = russh::Error;
 
-    async fn check_server_key(
-        &mut self,
-        _k: &PublicKeyOrCertificate,
-    ) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, _k: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
@@ -53,7 +50,10 @@ impl Handler for Client {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let relay = args.first().cloned().unwrap_or_else(|| "free.pinggy.io:443".into());
+    let relay = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "free.pinggy.io:443".into());
     let proxy = args
         .get(1)
         .cloned()
@@ -158,11 +158,7 @@ async fn fingerprint(
     Ok(buf[..n].to_vec())
 }
 
-async fn connect(
-    proxy: &str,
-    host: &str,
-    port: u16,
-) -> Option<russh::client::Handle<Client>> {
+async fn connect(proxy: &str, host: &str, port: u16) -> Option<russh::client::Handle<Client>> {
     let raw = match cfrs::proxy::connect_tunnel(proxy, host, port, Duration::from_secs(20)) {
         Ok(v) => v,
         Err(e) => {
@@ -184,14 +180,16 @@ async fn connect(
     };
     let stream = Prefixed::new(leftover, stream);
 
-    let key =
-        match PrivateKey::random(&mut UnwrapErr(ssh_key::getrandom::SysRng), Algorithm::Ed25519) {
-            Ok(k) => k,
-            Err(e) => {
-                println!("key      : FAILED {e}");
-                return None;
-            }
-        };
+    let key = match PrivateKey::random(
+        &mut UnwrapErr(ssh_key::getrandom::SysRng),
+        Algorithm::Ed25519,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("key      : FAILED {e}");
+            return None;
+        }
+    };
     let mut cfg = Config::default();
     cfg.inactivity_timeout = Some(Duration::from_secs(600));
 
