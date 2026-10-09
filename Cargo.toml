@@ -1,0 +1,32 @@
+[package]
+name = "cfrs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Cloudflare quick-tunnel client, written in Rust, for constrained sandboxes"
+license = "0BSD"
+repository = "https://github.com/talaria0101/cfrs"
+readme = "README.md"
+keywords = ["cloudflare", "tunnel", "quick-tunnel", "trycloudflare", "ssh"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+# The Cloudflare quick-tunnel provisioning API is a plain JSON POST.
+# `ureq` is deliberately used over a full async HTTP client: this call is a
+# single synchronous request/response and needs no connection pooling.
+# Pinned to the 2.x API; 3.x changed the request builder shape.
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SSH remote forwarding, for environments where the Cloudflare tunnel edge is
+# not reachable and a TCP relay over port 443 is.
+russh = "0.64"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# getrandom-backed OS entropy for the ephemeral SSH key. Pinned to the same
+# ssh-key line russh uses so the CryptoRng trait bounds unify.
+ssh-key = { version = "0.7.0-rc.11", features = ["getrandom"] }
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 2
