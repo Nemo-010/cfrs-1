@@ -143,3 +143,77 @@ version: 1.104.1-t7f4efe814-g8da26756c (go1.27.1)
   reports `0.0.0.0:0` and TCP-level `setsockopt` is swallowed. A program that
   needs the real local port of its outbound connection (active FTP, some
   protocol negotiators) will not get it.
+
+## Tailscale SSH in a passwd-less sandbox
+
+`tailscaled --ssh` serves an SSH server from inside the same userspace
+netstack. That is the natural way *into* a sealed host over the tailnet, and it
+does not need the front door above. It does need a local login to serve, and
+the host this was built in has no `/etc/passwd`, no `/etc/group`, and an
+`/etc` that Landlock keeps read-only. The first attempt ends the session with
+`No user exists for uid 966`.
+
+`tailscaled` is a static Go binary, so `LD_PRELOAD` cannot interpose it, and it
+does not call libc for this anyway. Reading its `osuser` package shows exactly
+three things it does:
+
+| call | source | fallback |
+|---|---|---|
+| `getent passwd [--] <name\|uid>` | `util/osuser/user.go` | `os/user` (reads `/etc/passwd`) |
+| `id -Gz <name>` | `util/osuser/group_ids.go` | `user.GroupIds()` (reads `/etc/group`) |
+| `/etc/group` | only if `id` failed | — |
+
+Two helper commands first on the daemon's `PATH` answer the first two, and the
+third is never reached. `cfrs net ts-shims` writes them, plus an `LD_PRELOAD`
+table (`shim/fakepwd.c`) for a *dynamic* client on the same host, which still
+calls `getpwuid(3)`:
+
+```sh
+cfrs net ts-shims --out /run/cfrs-ts-shims --user nemo
+```
+
+```
+cfrs: shims    /run/cfrs-ts-shims
+cfrs: user     nemo uid=966 gid=965
+cfrs: passwd   /run/cfrs-ts-shims/passwd
+cfrs: fakepwd  /run/cfrs-ts-shims/fakepwd.so
+cfrs: daemon   PATH=/run/cfrs-ts-shims:$PATH tailscaled ... --statedir /run/cfrs-ts-shims
+```
+
+Two things are easy to miss:
+
+- **`--statedir`.** Without a writable one the daemon logs `unable to get SSH
+  host keys, SSH will appear as disabled for this node`, never advertises an
+  SSH endpoint, and the client hangs. It is what makes the host keys in
+  `HostInfo` possible.
+- **The login must be the daemon's own uid.** An unprivileged daemon cannot
+  `setuid(0)`; upstream `ssh/tailssh/incubator.go` calls
+  `syscall.Setuid(wantUid)` and fatals on `EPERM`. `root@` fails however the
+  user table is written. Log in as the daemon's user.
+
+### What is proven
+
+With the stock 1.104.1 daemon, `--tun=userspace-networking --ssh`, the
+generated shims first on `PATH`, and a writable `--statedir`:
+
+- `HostInfo` advertises `sshHostKeys` (`ssh-rsa`, `ecdsa-sha2-nistp256`,
+  `ssh-ed25519`) and a `tcp:22` service, and the `unable to get SSH host keys`
+  warning is gone.
+- A connection to `nemo@100.119.211.25:22` is accepted by the server
+  (`handling conn: ...->nemo@...:22`) and passes user and group resolution.
+- It then stops at Tailscale's own **check-mode** ACL and prints
+  `# Tailscale SSH requires an additional check. To authenticate, visit:
+  https://login.tailscale.com/a/...`. That is the tailnet's SSH policy, not the
+  sandbox: the daemon receives it from the coordination server, and a `check`
+  rule asks for a browser approval. The policy in this tailnet has two rules
+  with identical principals and `sshUsers` (`{"*": "=", "0": "", "root":
+  "root"}`), the first `holdAndDelegate`, so the first always wins. Approve the
+  URL once, or change the ACL's `ssh` action to `accept`.
+- A control connection with the shims removed fails earlier, at
+  `failed to look up local user's group IDs: open /etc/group: no such file or
+  directory`, which is the fallback this avoids.
+
+The daemon and the release tarball are the same stock binaries recorded above.
+The only things added are scripts the daemon itself invokes and an
+`LD_PRELOAD` library for the client; Tailscale is not patched, recompiled or
+re-linked.

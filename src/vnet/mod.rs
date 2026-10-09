@@ -48,6 +48,7 @@ pub mod shim;
 pub mod socks;
 pub mod stack;
 pub mod tailscale;
+pub mod tailscale_ssh;
 
 pub use addr::{Family, VirtAddr, VirtualSubnet};
 pub use control::{ControlMessage, ControlOp};
@@ -57,3 +58,4 @@ pub use proxy::{handle_connection, ProxyListen};
 pub use record::{PcapFile, RecordedPacket, Recorder, Replayer};
 pub use stack::{Clock, NetStack, StackConfig, StackEvent, TcpStream, UdpSocket};
 pub use tailscale::{Dialer, TailscaleProxy};
+pub use tailscale_ssh::{LocalUser, Shims};

@@ -140,6 +140,19 @@ eval "$(cfrs net socksify --proxy /run/cfrssocks.sock)"
 curl http://100.x.y.z:8080/
 ```
 
+The daemon can also serve SSH (`tailscaled --ssh`) straight from its netstack,
+which is the way *into* a sealed host. It resolves the login on the local
+system, though, and a sandbox with no `/etc/passwd` and a read-only `/etc` has
+nothing to resolve. `cfrs net ts-shims` writes the two helper commands the
+static Go daemon shells out to (`getent`, `id`) plus an `LD_PRELOAD` table for
+dynamic clients, so the daemon stays untouched:
+
+```sh
+cfrs net ts-shims --out /run/cfrs-ts-shims --user nemo
+PATH=/run/cfrs-ts-shims:$PATH tailscaled --tun=userspace-networking \
+    --statedir /run/cfrs-ts-shims --socket /run/tailscale/tailscaled.sock
+```
+
 The measurements that force this shape, what is proven live, and the limits
 (no UDP, names through `getaddrinfo`, `Dial-Self`) are in
 [`TAILSCALE.md`](./TAILSCALE.md).

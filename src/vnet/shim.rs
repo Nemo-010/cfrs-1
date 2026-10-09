@@ -214,7 +214,7 @@ pub fn build_socks(directory: &Path) -> Result<Shim> {
     compile_source(SOCKS_SHIM_SOURCE, SOCKS_SHIM_FILE, directory)
 }
 
-fn compile_source(source_text: &str, file_name: &str, directory: &Path) -> Result<Shim> {
+pub(crate) fn compile_source(source_text: &str, file_name: &str, directory: &Path) -> Result<Shim> {
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating shim directory {}", directory.display()))?;
     let source = directory.join(file_name.replace(".so", ".c"));

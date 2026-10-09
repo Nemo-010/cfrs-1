@@ -80,6 +80,7 @@ net SUBCOMMAND:
     cfrs net proxy [OPTIONS]    SOCKS5 / HTTP CONNECT to a real unix destination
     cfrs net tailscale [OPTIONS] SOCKS5 / HTTP CONNECT to a tailnet via tailscaled
     cfrs net socksify [OPTIONS]  Build the shim that redirects tailnet connects
+    cfrs net ts-shims [OPTIONS]  Write the user-table shims Tailscale SSH needs
 
 net shim OPTIONS:
         --out DIR                Where to build when no shim is found
@@ -111,6 +112,14 @@ net socksify OPTIONS:
         --log                    Log every redirect to stderr
         --json                   Print the environment as JSON
 
+net ts-shims OPTIONS:
+        --out DIR                Where to write passwd/group/getent/id/fakepwd.so
+                                  [default: /tmp/cfrs-ts-shims]
+        --user NAME              Local login name [default: $USER]
+        --uid N                  Local uid [default: the current one]
+        --gid N                  Local gid [default: the current one]
+        --json                   Print the client environment as JSON
+
 EXAMPLES:
     cfrs tunnel --url http://localhost:8080
     cfrs tunnel --unix /run/app.sock --protocol http2
@@ -123,6 +132,7 @@ EXAMPLES:
     cfrs net tailscale --socket /run/tailscale/tailscaled.sock
     eval \"$(cfrs net socksify --proxy /tmp/cfrssocks.sock)\"
     curl http://100.x.y.z:8080/
+    cfrs net ts-shims --out /run/cfrs-ts-shims
 ";
 
 fn main() -> ExitCode {
@@ -595,6 +605,7 @@ const NET_FLAGS: &[&str] = &["out", "log", "map-loopback", "json"];
 const NET_PROXY_FLAGS: &[&str] = &["listen", "map", "forward", "port", "run-for"];
 const NET_TAILSCALE_FLAGS: &[&str] = &["socket", "listen", "port", "run-for"];
 const NET_SOCKSIFY_FLAGS: &[&str] = &["out", "proxy", "log", "json"];
+const NET_TS_SHIMS_FLAGS: &[&str] = &["out", "user", "uid", "gid", "json"];
 
 fn cmd_net(args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
@@ -639,8 +650,9 @@ fn cmd_net(args: &[String]) -> Result<(), String> {
         "proxy" => cmd_net_proxy(rest),
         "tailscale" => cmd_net_tailscale(rest),
         "socksify" => cmd_net_socksify(rest),
+        "ts-shims" => cmd_net_ts_shims(rest),
         other => Err(format!(
-            "unknown net subcommand {other:?}; expected demo, doctor, addresses, shim, proxy, tailscale, socksify"
+            "unknown net subcommand {other:?}; expected demo, doctor, addresses, shim, proxy, tailscale, socksify, ts-shims"
         )),
     }
 }
@@ -865,6 +877,59 @@ fn cmd_net_tailscale(args: &[String]) -> Result<(), String> {
         proxy.abort();
         Ok(())
     })
+}
+
+fn cmd_net_ts_shims(args: &[String]) -> Result<(), String> {
+    use cfrs::vnet::tailscale_ssh;
+
+    let flags = Flags::parse(args)?;
+    flags.reject_unknown(NET_TS_SHIMS_FLAGS)?;
+
+    let directory = flags.get("out").map_or_else(
+        || std::env::temp_dir().join("cfrs-ts-shims"),
+        std::path::PathBuf::from,
+    );
+    let mut user = tailscale_ssh::current_user();
+    if let Some(name) = flags.get("user") {
+        user.name = name.to_string();
+    }
+    if let Some(uid) = flags.get("uid") {
+        user.uid = uid.parse().map_err(|_| "--uid expects a number".to_string())?;
+    }
+    if let Some(gid) = flags.get("gid") {
+        user.gid = gid.parse().map_err(|_| "--gid expects a number".to_string())?;
+    }
+
+    let shims = tailscale_ssh::install(&directory, &[user.clone()])
+        .map_err(|e| e.to_string())?;
+    let environment = tailscale_ssh::client_environment(&shims);
+
+    if flags.present("json") {
+        let object: serde_json::Map<String, serde_json::Value> = environment
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value)))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&object).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!("cfrs: shims    {}", shims.dir.display());
+    println!("cfrs: user     {} uid={} gid={}", user.name, user.uid, user.gid);
+    println!("cfrs: passwd   {}", shims.passwd.display());
+    println!("cfrs: fakepwd  {}", shims.fakepwd.display());
+    println!(
+        "cfrs: daemon   PATH={}:$PATH tailscaled ... --statedir {}",
+        shims.dir.display(),
+        shims.dir.display()
+    );
+    println!("cfrs: note     --statedir is what lets the daemon keep SSH host keys");
+    for (key, value) in &environment {
+        println!("  export {key}={value}");
+    }
+    Ok(())
 }
 
 fn cmd_net_socksify(args: &[String]) -> Result<(), String> {
