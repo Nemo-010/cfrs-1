@@ -164,6 +164,15 @@ The measurements that force this shape, what is proven live, and the limits
 (no UDP, names through `getaddrinfo`, `Dial-Self`) are in
 [`TAILSCALE.md`](./TAILSCALE.md).
 
+## `pod-netns`: proxying without shims
+
+Every interposer above can only reach a *dynamic* binary. `pod-netns` is the
+kernel-enforced answer: it runs a program in a network namespace whose only
+interface is a TUN the parent drives with the `cfrs` userspace stack, so any
+program — static, Go, libc-free — has its egress forced through a SOCKS5/HTTP
+proxy. `pod-netns doctor` measures what the host permits first. See
+[`POD-NETNS.md`](./POD-NETNS.md).
+
 ## What was measured, and where the boundary is
 
 Every claim below was measured in the development sandbox on 2026-10-09. The
