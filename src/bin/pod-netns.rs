@@ -65,6 +65,20 @@ const IFF_NO_PI: libc::c_int = 0x1000;
 /// of the program itself.
 const EXIT_NO_BACKEND: i32 = 3;
 
+/// An upstream that never answers must not stall the supervisor and the child's
+/// `connect` forever.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn within_timeout<F, T>(what: &str, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(UPSTREAM_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => bail!("{what} timed out after {:?}", UPSTREAM_TIMEOUT),
+    }
+}
+
 // ── proxy configuration ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1364,8 +1378,12 @@ where
         split_target(target)?
     };
     let mut req = vec![0x05, 0x01, 0x00];
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<Ipv4Addr>() {
         req.push(0x01);
+        req.extend_from_slice(&ip.octets());
+    } else if let Ok(ip) = bare.parse::<std::net::Ipv6Addr>() {
+        req.push(0x04);
         req.extend_from_slice(&ip.octets());
     } else {
         req.push(0x03);
@@ -1848,7 +1866,12 @@ async fn serve_one(conn: Upstream, chain: &[Proxy], rules: &[Rule], verbose: boo
                     selected[0].endpoint()
                 );
             }
-            let mut upstream = match connect_upstream_async(selected, &target).await {
+            let mut upstream = match within_timeout(
+                "front door connect",
+                connect_upstream_async(selected, &target),
+            )
+            .await
+            {
                 Ok(u) => u,
                 Err(e) => {
                     let _ = socks::socks5_reply(
@@ -1868,7 +1891,12 @@ async fn serve_one(conn: Upstream, chain: &[Proxy], rules: &[Rule], verbose: boo
             let request = socks::http_read_connect(&mut reader).await?;
             let target = format!("{}:{}", request.host, request.port);
             let selected = select_chain(rules, chain, &target);
-            let mut upstream = match connect_upstream_async(selected, &target).await {
+            let mut upstream = match within_timeout(
+                "front door connect",
+                connect_upstream_async(selected, &target),
+            )
+            .await
+            {
                 Ok(u) => u,
                 Err(e) => {
                     let _ = socks::http_connect_reply(&mut reader, 502, "Bad Gateway").await;
@@ -2617,7 +2645,7 @@ async fn handle_connect(
     if verbose {
         eprintln!("pod-netns: connect {target} via {}", chain[0].endpoint());
     }
-    match connect_upstream_async(chain, &target).await {
+    match within_timeout("upstream connect", connect_upstream_async(chain, &target)).await {
         Ok(mut upstream) => {
             notif_respond(lfd, id, 0, 0)?;
             if let Some(Sock::Stream { pair: mut pair, .. }) = map.remove(&fd) {
@@ -2803,8 +2831,9 @@ async fn ensure_udp_relay(
     if proxy.kind != ProxyKind::Socks5 {
         bail!("UDP relay needs a SOCKS5 proxy");
     }
-    let control = dial_proxy(proxy).await?;
-    let (control, relay_addr) = socks5_udp_associate(control, proxy).await?;
+    let control = within_timeout("udp associate dial", dial_proxy(proxy)).await?;
+    let (control, relay_addr) =
+        within_timeout("udp associate", socks5_udp_associate(control, proxy)).await?;
     let udp = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
     let reader = udp.clone();
     tokio::spawn(async move {
