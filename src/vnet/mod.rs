@@ -47,6 +47,7 @@ pub mod record;
 pub mod shim;
 pub mod socks;
 pub mod stack;
+pub mod tailscale;
 
 pub use addr::{Family, VirtAddr, VirtualSubnet};
 pub use control::{ControlMessage, ControlOp};
@@ -55,3 +56,4 @@ pub use policy::{Acl, AclAction, AclRule};
 pub use proxy::{handle_connection, ProxyListen};
 pub use record::{PcapFile, RecordedPacket, Recorder, Replayer};
 pub use stack::{Clock, NetStack, StackConfig, StackEvent, TcpStream, UdpSocket};
+pub use tailscale::{Dialer, TailscaleProxy};

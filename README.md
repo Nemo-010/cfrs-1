@@ -123,6 +123,27 @@ deterministic replay). What is still open, including the single-waker caveat and
 the unwired control server, is listed in §11 of
 [`VIRTUAL-NETWORK.md`](./VIRTUAL-NETWORK.md).
 
+## Tailscale, unpatched
+
+A host that forbids `AF_INET` binds and restricts `AF_INET` connects to a few
+ports can still join a tailnet. `tailscaled --tun=userspace-networking` runs
+the whole stack in userspace, and the one door it always leaves open is its
+`LocalAPI` unix socket. `cfrs net tailscale` puts a SOCKS5 / HTTP `CONNECT`
+front door on an `AF_UNIX` socket and dials every request through the daemon's
+`ts-dial` local API; `cfrs net socksify` builds the shim that redirects an
+unmodified program's `connect(2)` to it. Nothing patches or re-links Tailscale.
+
+```sh
+cfrs net tailscale --socket /run/tailscale/tailscaled.sock \
+                   --listen unix:/run/cfrssocks.sock
+eval "$(cfrs net socksify --proxy /run/cfrssocks.sock)"
+curl http://100.x.y.z:8080/
+```
+
+The measurements that force this shape, what is proven live, and the limits
+(no UDP, names through `getaddrinfo`, `Dial-Self`) are in
+[`TAILSCALE.md`](./TAILSCALE.md).
+
 ## What was measured, and where the boundary is
 
 Every claim below was measured in the development sandbox on 2026-10-09. The
@@ -375,6 +396,7 @@ removing the fix to confirm the test goes red:
 | `tests/af_inet_kernel.rs` | the kernel files a mapped socket as `AF_UNIX`, measured by socket inode, with the sealed-host control |
 | `tests/shim_direct.rs` | two unmodified programs exchange data over abstract names |
 | `tests/shim_no_socket.rs` | programs that never open a socket keep working |
+| `tests/shim_socks.rs` | an unmodified program's `AF_INET` connect reaches an echo through the tailnet front door |
 | `tests/vnet_regressions.rs` | the UTF-8 truncation panic, the decoder wedge, the socket leak and the poll-interval knob |
 
 `tools/check-header-oracle.sh` is not part of `cargo test`. Run it to rebuild
