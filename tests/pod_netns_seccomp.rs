@@ -1,4 +1,4 @@
-//! End-to-end test for `pod-netns`'s seccomp backend.
+//! End-to-end tests for `pod-netns`'s seccomp backend.
 //!
 //! A SOCKS5 proxy listens on a unix socket (the only bind a sealed host
 //! permits). A compiled C program calls `socket(AF_INET)`/`connect(AF_INET)`
@@ -6,14 +6,17 @@
 //! and dials the proxy. No `LD_PRELOAD` is involved, so a **static** build is
 //! exercised too — that is the whole point of the backend.
 //!
-//! If the host does not offer `SECCOMP_RET_USER_NOTIF` the test reports that
-//! and passes, as the other shim tests do when no compiler is present.
+//! Three tests: a single proxy, two chained hops, and UDP relayed through
+//! `UDP ASSOCIATE`. If the host does not offer `SECCOMP_RET_USER_NOTIF` they
+//! report that and pass, as the other shim tests do without a compiler.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use cfrs::vnet::shim;
 
@@ -41,58 +44,80 @@ fn build_program(dir: &std::path::Path, name: &str, source: &str, static_link: b
     output
 }
 
-/// A minimal SOCKS5 proxy on a unix socket: no auth, CONNECT only, then a
-/// greeting and an echo.
-fn socks5_echo(listener: UnixListener, targets: mpsc::Sender<String>) {
+/// Read a SOCKS5 request after the method handshake; returns (cmd, host, port).
+fn read_request(c: &mut UnixStream) -> Option<(u8, String, u16)> {
+    let mut hdr = [0u8; 2];
+    c.read_exact(&mut hdr).ok()?;
+    let mut methods = vec![0u8; hdr[1] as usize];
+    c.read_exact(&mut methods).ok()?;
+    c.write_all(&[5, 0]).ok()?;
+    let mut req = [0u8; 4];
+    c.read_exact(&mut req).ok()?;
+    let host = match req[3] {
+        1 => {
+            let mut a = [0u8; 4];
+            c.read_exact(&mut a).ok()?;
+            Ipv4Addr::from(a).to_string()
+        }
+        3 => {
+            let mut l = [0u8; 1];
+            c.read_exact(&mut l).ok()?;
+            let mut h = vec![0u8; l[0] as usize];
+            c.read_exact(&mut h).ok()?;
+            String::from_utf8_lossy(&h).to_string()
+        }
+        4 => {
+            let mut a = [0u8; 16];
+            c.read_exact(&mut a).ok()?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => return None,
+    };
+    let mut p = [0u8; 2];
+    c.read_exact(&mut p).ok()?;
+    Some((req[1], host, u16::from_be_bytes(p)))
+}
+
+/// A SOCKS5 CONNECT proxy on a unix socket. With `hop`, a target named
+/// `unix:<path>` is forwarded to that socket; otherwise it greets and echoes.
+fn socks5_proxy(listener: UnixListener, targets: mpsc::Sender<String>, hop: bool) {
     for conn in listener.incoming() {
         let mut c = match conn {
             Ok(c) => c,
             Err(_) => break,
         };
-        let _ = (|| -> std::io::Result<()> {
-            let mut hdr = [0u8; 2];
-            c.read_exact(&mut hdr)?;
-            let mut methods = vec![0u8; hdr[1] as usize];
-            c.read_exact(&mut methods)?;
-            c.write_all(&[5, 0])?;
-            let mut req = [0u8; 4];
-            c.read_exact(&mut req)?;
-            let host = match req[3] {
-                1 => {
-                    let mut a = [0u8; 4];
-                    c.read_exact(&mut a)?;
-                    std::net::Ipv4Addr::from(a).to_string()
-                }
-                3 => {
-                    let mut l = [0u8; 1];
-                    c.read_exact(&mut l)?;
-                    let mut h = vec![0u8; l[0] as usize];
-                    c.read_exact(&mut h)?;
-                    String::from_utf8_lossy(&h).to_string()
-                }
-                4 => {
-                    let mut a = [0u8; 16];
-                    c.read_exact(&mut a)?;
-                    std::net::Ipv6Addr::from(a).to_string()
-                }
-                _ => return Ok(()),
+        let targets = targets.clone();
+        let _ = std::thread::spawn(move || {
+            let Some((cmd, host, port)) = read_request(&mut c) else {
+                return;
             };
-            let mut p = [0u8; 2];
-            c.read_exact(&mut p)?;
-            let port = u16::from_be_bytes(p);
-            let _ = targets.send(format!("{host}:{port}"));
-            c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])?;
-            c.write_all(b"HELLO-FROM-TARGET\n")?;
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = c.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                c.write_all(&buf[..n])?;
+            if cmd != 1 {
+                return;
             }
-            Ok(())
-        })();
+            let _ = targets.send(format!("{host}:{port}"));
+            if hop && host.starts_with("unix:") {
+                let Ok(mut up) = UnixStream::connect(&host[5..]) else {
+                    return;
+                };
+                let _ = c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+                let mut up2 = up.try_clone().unwrap();
+                let mut c2 = c.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut up2, &mut c2);
+                    let _ = c2.shutdown(std::net::Shutdown::Write);
+                });
+                let _ = std::io::copy(&mut c, &mut up);
+            } else {
+                let _ = c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+                let _ = c.write_all(b"HELLO-FROM-TARGET\n");
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = c.read(&mut buf) {
+                    if n == 0 || c.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -102,6 +127,21 @@ fn seccomp_available() -> bool {
         .output()
         .expect("run pod-netns doctor");
     String::from_utf8_lossy(&out.stdout).contains("SECCOMP_RET_USER_NOTIF    ok")
+}
+
+fn run(dir: &std::path::Path, proxies: &[&std::path::Path], program: &std::path::Path) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pod-netns"));
+    cmd.args(["--backend", "seccomp"]);
+    for p in proxies {
+        cmd.arg("-x").arg(format!("unix:{}", p.display()));
+    }
+    let output = cmd.arg("--").arg(program).output().expect("run pod-netns");
+    assert!(
+        output.status.success(),
+        "pod-netns failed: stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 const CLIENT: &str = r#"
@@ -124,47 +164,163 @@ int main(void) {
 }
 "#;
 
+const UDP_CLIENT: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+int main(void) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in d; memset(&d, 0, sizeof d);
+    d.sin_family = AF_INET; d.sin_port = htons(9999);
+    inet_pton(AF_INET, "127.0.0.1", &d.sin_addr);
+    if (sendto(s, "PING", 4, 0, (struct sockaddr *)&d, sizeof d) < 0) { perror("sendto"); return 1; }
+    char b[128] = {0};
+    int n = recvfrom(s, b, sizeof b - 1, 0, NULL, NULL);
+    printf("UDP:%d:%s", n, n > 0 ? b : "");
+    return 0;
+}
+"#;
+
 #[test]
 fn seccomp_backend_proxies_a_static_and_a_dynamic_binary() {
-    if !have_compiler() {
-        eprintln!("no C compiler; skipping");
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
         return;
     }
-    if !seccomp_available() {
-        eprintln!("SECCOMP_RET_USER_NOTIF not available; skipping");
-        return;
-    }
-
     let dir = std::env::temp_dir().join(format!("pod-netns-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("socks.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || socks5_echo(listener, tx));
+    std::thread::spawn(move || socks5_proxy(listener, tx, false));
 
     let dynamic = build_program(&dir, "client-dynamic", CLIENT, false);
     let statically = build_program(&dir, "client-static", CLIENT, true);
-
     for program in [&dynamic, &statically] {
-        let output = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
-            .args(["--backend", "seccomp", "-x"])
-            .arg(format!("unix:{}", sock.display()))
-            .arg("--")
-            .arg(program)
-            .output()
-            .expect("run pod-netns");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("READ:18:HELLO-FROM-TARGET"),
-            "{} did not reach the proxy: stdout={stdout:?} stderr={:?}",
-            program.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stdout = run(&dir, &[&sock], program);
+        assert!(stdout.contains("READ:18:HELLO-FROM-TARGET"), "{stdout:?}");
+    }
+    assert_eq!(rx.recv().unwrap(), "93.184.216.34:80");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn seccomp_backend_chains_two_proxies() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("p1.sock");
+    let p2 = dir.join("p2.sock");
+    let (tx1, rx1) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+    let l2 = UnixListener::bind(&p2).unwrap();
+    let l1 = UnixListener::bind(&p1).unwrap();
+    std::thread::spawn(move || socks5_proxy(l2, tx2, false));
+    std::thread::spawn(move || socks5_proxy(l1, tx1, true));
+
+    let program = build_program(&dir, "client-chain", CLIENT, false);
+    let stdout = run(&dir, &[&p1, &p2], &program);
+    assert!(stdout.contains("READ:18:HELLO-FROM-TARGET"), "{stdout:?}");
+    // The first hop was asked for the second, not for the target.
+    assert_eq!(rx1.recv().unwrap(), format!("unix:{}:0", p2.display()));
+    assert_eq!(rx2.recv().unwrap(), "93.184.216.34:80");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn seccomp_backend_relays_udp() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-udp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("socks.sock");
+
+    // A UDP echo, the thing the client believes it is talking to.
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        while let Ok((n, from)) = echo.recv_from(&mut buf) {
+            let mut reply = b"ECHO:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            let _ = echo.send_to(&reply, from);
+        }
+    });
+
+    // A SOCKS5 proxy with UDP ASSOCIATE on a unix control socket.
+    let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let listener = UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let mut c = match conn {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let Some((cmd, _host, _port)) = read_request(&mut c) else {
+                continue;
+            };
+            if cmd != 3 {
+                continue;
+            }
+            let mut bnd = vec![5u8, 0, 0, 1];
+            bnd.extend_from_slice(
+                &relay_addr
+                    .ip()
+                    .to_string()
+                    .parse::<Ipv4Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            bnd.extend_from_slice(&relay_addr.port().to_be_bytes());
+            let _ = c.write_all(&bnd);
+            // Hold the control connection open for the life of the test.
+            let mut buf = [0u8; 1];
+            while c.read(&mut buf).unwrap_or(0) == 1 {}
+        }
+    });
+    // The relay: unwrap a SOCKS5 UDP header, forward, wrap the reply.
+    {
+        let echo_addr = echo_addr;
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65535];
+            while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                if n < 4 {
+                    continue;
+                }
+                let off = match buf[3] {
+                    1 => 10,
+                    3 => 4 + 1 + buf[4] as usize + 2,
+                    4 => 22,
+                    _ => continue,
+                };
+                if n < off {
+                    continue;
+                }
+                let up = UdpSocket::bind("127.0.0.1:0").unwrap();
+                up.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let _ = up.send_to(&buf[off..n], echo_addr);
+                let mut reply = [0u8; 65535];
+                if let Ok((rn, _)) = up.recv_from(&mut reply) {
+                    let mut out = vec![0u8, 0, 0, 1, 127, 0, 0, 1];
+                    out.extend_from_slice(&echo_addr.port().to_be_bytes());
+                    out.extend_from_slice(&reply[..rn]);
+                    let _ = relay.send_to(&out, from);
+                }
+            }
+        });
     }
 
-    // The proxy must have seen the address the client asked for.
-    let first = rx.recv().unwrap();
-    assert_eq!(first, "93.184.216.34:80");
-
+    let program = build_program(&dir, "udp-client", UDP_CLIENT, false);
+    let stdout = run(&dir, &[&sock], &program);
+    assert!(stdout.contains("UDP:9:ECHO:PING"), "{stdout:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

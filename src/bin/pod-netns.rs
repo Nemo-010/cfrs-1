@@ -23,8 +23,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -143,6 +144,13 @@ impl Proxy {
             Some(p) => format!("unix:{p}"),
             None => format!("{}:{}", self.host, self.port),
         }
+    }
+
+    /// How the previous hop should address this one when chaining. A unix
+    /// socket has no `host:port`, so it is named `unix:<path>` and the hop in
+    /// front resolves it (the same convention the tests' proxy uses).
+    fn chain_addr(&self) -> String {
+        self.endpoint()
     }
 }
 
@@ -1075,28 +1083,38 @@ pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
 pub type Upstream = Box<dyn AsyncStream>;
 
-/// Dial the proxy, over TCP or a unix socket, and run its handshake. The
-/// result is a stream carrying the target's bytes, whatever the transport.
-async fn connect_upstream_async(proxy: &Proxy, target: &str) -> Result<Upstream> {
-    let stream: Upstream = match &proxy.unix_path {
-        Some(path) => Box::new(
-            tokio::net::UnixStream::connect(path)
-                .await
-                .with_context(|| format!("connect to unix proxy {path}"))?,
-        ),
-        None => Box::new(
-            tokio::net::TcpStream::connect(proxy.endpoint())
-                .await
-                .with_context(|| format!("connect to proxy {}", proxy.endpoint()))?,
-        ),
-    };
-    match proxy.kind {
-        ProxyKind::Socks5 => socks5_connect(stream, proxy, target).await,
-        ProxyKind::Http => http_connect(stream, proxy, target).await,
+/// Dial the proxy and run its handshake. With more than one `-x`, the hops
+/// are **chained**: dial the first, then ask each hop to CONNECT to the next,
+/// and finally ask the last for the target. Each intermediate hop sees only the
+/// address of the next one.
+async fn connect_upstream_async(chain: &[Proxy], target: &str) -> Result<Upstream> {
+    let (first, rest) = chain.split_first().context("no proxy configured")?;
+    let mut stream: Upstream = dial_proxy(first).await?;
+    if rest.is_empty() {
+        return match first.kind {
+            ProxyKind::Socks5 => socks5_connect(stream, first, target).await,
+            ProxyKind::Http => http_connect(stream, first, target).await,
+        };
+    }
+    for (i, hop) in chain.iter().enumerate().take(chain.len() - 1) {
+        if hop.kind != ProxyKind::Socks5 {
+            bail!(
+                "chaining needs SOCKS5 hops; {} is {:?}",
+                hop.endpoint(),
+                hop.kind
+            );
+        }
+        let next = &chain[i + 1];
+        stream = socks5_connect(stream, hop, &next.chain_addr()).await?;
+    }
+    let last = chain.last().unwrap();
+    match last.kind {
+        ProxyKind::Socks5 => socks5_connect(stream, last, target).await,
+        ProxyKind::Http => http_connect(stream, last, target).await,
     }
 }
 
-async fn socks5_connect<S>(mut stream: S, proxy: &Proxy, target: &str) -> Result<S>
+async fn socks5_handshake<S>(mut stream: S, proxy: &Proxy) -> Result<S>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1126,7 +1144,64 @@ where
             bail!("SOCKS5 authentication failed");
         }
     }
-    let (host, port) = split_target(target)?;
+    Ok(stream)
+}
+
+/// Read an `ATYP`-prefixed address and port from a SOCKS5 reply.
+async fn read_socks_addr<S>(stream: &mut S, atyp: u8) -> Result<SocketAddr>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    match atyp {
+        0x01 => {
+            let mut b = [0u8; 6];
+            stream.read_exact(&mut b).await?;
+            Ok(SocketAddr::from((
+                Ipv4Addr::new(b[0], b[1], b[2], b[3]),
+                u16::from_be_bytes([b[4], b[5]]),
+            )))
+        }
+        0x04 => {
+            let mut b = [0u8; 18];
+            stream.read_exact(&mut b).await?;
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b[..16]);
+            Ok(SocketAddr::from((
+                std::net::Ipv6Addr::from(o),
+                u16::from_be_bytes([b[16], b[17]]),
+            )))
+        }
+        0x03 => {
+            let mut l = [0u8; 1];
+            stream.read_exact(&mut l).await?;
+            let mut host = vec![0u8; l[0] as usize];
+            stream.read_exact(&mut host).await?;
+            let mut p = [0u8; 2];
+            stream.read_exact(&mut p).await?;
+            let host = String::from_utf8_lossy(&host).to_string();
+            let ip: IpAddr = host
+                .parse()
+                .context("relay returned a name, not an address")?;
+            Ok(SocketAddr::new(ip, u16::from_be_bytes(p)))
+        }
+        other => bail!("bad SOCKS5 address type {other}"),
+    }
+}
+
+async fn socks5_connect<S>(stream: S, proxy: &Proxy, target: &str) -> Result<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let mut stream = socks5_handshake(stream, proxy).await?;
+    // A chained hop is addressed as `unix:<path>`; there is no host:port, so
+    // the whole string goes as a domain and the port is 0. The hop resolves it.
+    let (host, port) = if target.starts_with("unix:") {
+        (target.to_string(), 0u16)
+    } else {
+        split_target(target)?
+    };
     let mut req = vec![0x05, 0x01, 0x00];
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         req.push(0x01);
@@ -1139,29 +1214,32 @@ where
     req.extend_from_slice(&port.to_be_bytes());
     stream.write_all(&req).await?;
     let mut head = [0u8; 4];
-    stream.read_exact(&mut head).await?;
+    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut head).await?;
     if head[1] != 0x00 {
         bail!("SOCKS5 connect to {target} failed: code {}", head[1]);
     }
-    // Drain the bound address.
-    match head[3] {
-        0x01 => {
-            let mut b = [0u8; 6];
-            stream.read_exact(&mut b).await?;
-        }
-        0x04 => {
-            let mut b = [0u8; 18];
-            stream.read_exact(&mut b).await?;
-        }
-        0x03 => {
-            let mut l = [0u8; 1];
-            stream.read_exact(&mut l).await?;
-            let mut b = vec![0u8; l[0] as usize + 2];
-            stream.read_exact(&mut b).await?;
-        }
-        _ => bail!("bad SOCKS5 address type"),
-    }
+    read_socks_addr(&mut stream, head[3]).await?;
     Ok(stream)
+}
+
+/// `UDP ASSOCIATE`: keep the TCP control connection and learn the relay address.
+async fn socks5_udp_associate<S>(stream: S, proxy: &Proxy) -> Result<(S, SocketAddr)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = socks5_handshake(stream, proxy).await?;
+    // DST.ADDR/DST.PORT are the client's expected source; 0.0.0.0:0 means any.
+    stream
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await?;
+    if head[1] != 0x00 {
+        bail!("SOCKS5 UDP ASSOCIATE failed: code {}", head[1]);
+    }
+    let relay = read_socks_addr(&mut stream, head[3]).await?;
+    Ok((stream, relay))
 }
 
 async fn http_connect<S>(mut stream: S, proxy: &Proxy, target: &str) -> Result<S>
@@ -1530,7 +1608,7 @@ struct SeccompNotifAddfd {
 }
 
 /// The syscalls the filter stops. Everything else is allowed untouched.
-fn intercepted_syscalls() -> [libc::c_long; 10] {
+fn intercepted_syscalls() -> [libc::c_long; 11] {
     [
         libc::SYS_socket,
         libc::SYS_connect,
@@ -1542,6 +1620,7 @@ fn intercepted_syscalls() -> [libc::c_long; 10] {
         libc::SYS_getpeername,
         libc::SYS_setsockopt,
         libc::SYS_getsockopt,
+        libc::SYS_io_uring_setup,
     ]
 }
 
@@ -1741,9 +1820,21 @@ fn notif_continue(lfd: RawFd, id: u64) -> Result<()> {
     Ok(())
 }
 
+/// A live SOCKS5 UDP association: the relay socket, its address, and the TCP
+/// control connection that must stay open for the association to live.
+struct UdpRelay {
+    udp: Arc<tokio::net::UdpSocket>,
+    relay_addr: SocketAddr,
+    _control: Upstream,
+}
+
 enum Sock {
     Stream(tokio::net::UnixStream),
-    Datagram(tokio::net::UnixDatagram, Option<(IpAddr, u16)>),
+    Datagram {
+        pair: Arc<tokio::net::UnixDatagram>,
+        dest: Option<(IpAddr, u16)>,
+        relay: Option<UdpRelay>,
+    },
 }
 
 fn run_seccomp(args: Args) -> Result<i32> {
@@ -1883,11 +1974,11 @@ async fn supervise_seccomp(
         } else if nr == libc::SYS_connect as i32 {
             handle_connect(lfd, id, a, mem, &mut map, &mut dns, &proxies, verbose).await
         } else if nr == libc::SYS_sendto as i32 {
-            handle_sendto(lfd, id, a, mem, &mut map, &mut dns).await
+            handle_sendto(lfd, id, a, mem, &mut map, &mut dns, &proxies).await
         } else if nr == libc::SYS_sendmsg as i32 {
-            handle_sendmsg(lfd, id, a, mem, &mut map, &mut dns).await
+            handle_sendmsg(lfd, id, a, mem, &mut map, &mut dns, &proxies).await
         } else if nr == libc::SYS_sendmmsg as i32 {
-            handle_sendmmsg(lfd, id, a, mem, &mut map, &mut dns).await
+            handle_sendmmsg(lfd, id, a, mem, &mut map, &mut dns, &proxies).await
         } else if nr == libc::SYS_setsockopt as i32 {
             // An AF_UNIX socketpair rejects IP-level options, which makes
             // glibc's resolver give up before it ever sends. Pretend.
@@ -1898,6 +1989,10 @@ async fn supervise_seccomp(
             }
         } else if nr == libc::SYS_getsockopt as i32 {
             handle_getsockopt(lfd, id, a, mem, mem_writable, &mut map)
+        } else if nr == libc::SYS_io_uring_setup as i32 {
+            // io_uring submits network operations without the intercepted
+            // syscalls, which would bypass this filter entirely. Refuse it.
+            notif_respond(lfd, id, -1, libc::EPERM)
         } else if nr == libc::SYS_bind as i32 {
             // A datagram socket that binds a local port is a socketpair here;
             // pretend the bind succeeded.
@@ -1969,7 +2064,11 @@ fn handle_socket(lfd: RawFd, id: u64, a: [u64; 6], map: &mut HashMap<i32, Sock>)
         drop(theirs);
         map.insert(
             child_fd,
-            Sock::Datagram(tokio::net::UnixDatagram::from_std(ours)?, None),
+            Sock::Datagram {
+                pair: Arc::new(tokio::net::UnixDatagram::from_std(ours)?),
+                dest: None,
+                relay: None,
+            },
         );
     }
     Ok(())
@@ -1987,7 +2086,7 @@ async fn handle_connect(
     verbose: bool,
 ) -> Result<()> {
     let fd = a[0] as i32;
-    let is_datagram = matches!(map.get(&fd), Some(Sock::Datagram(..)));
+    let is_datagram = matches!(map.get(&fd), Some(Sock::Datagram { .. }));
     if !map.contains_key(&fd) {
         return notif_continue(lfd, id);
     }
@@ -1996,7 +2095,7 @@ async fn handle_connect(
         return notif_respond(lfd, id, -1, libc::EAFNOSUPPORT);
     };
     if is_datagram {
-        if let Some(Sock::Datagram(_, dest)) = map.get_mut(&fd) {
+        if let Some(Sock::Datagram { dest, .. }) = map.get_mut(&fd) {
             *dest = Some((ip, port));
         }
         return notif_respond(lfd, id, 0, 0);
@@ -2011,7 +2110,7 @@ async fn handle_connect(
     if verbose {
         eprintln!("pod-netns: connect {target} via {}", proxies[0].endpoint());
     }
-    match connect_upstream_async(&proxies[0], &target).await {
+    match connect_upstream_async(proxies, &target).await {
         Ok(mut upstream) => {
             notif_respond(lfd, id, 0, 0)?;
             if let Some(Sock::Stream(mut pair)) = map.remove(&fd) {
@@ -2037,16 +2136,17 @@ async fn handle_sendto(
     mem: RawFd,
     map: &mut HashMap<i32, Sock>,
     dns: &mut FakeDns,
+    proxies: &[Proxy],
 ) -> Result<()> {
     let fd = a[0] as i32;
     let buf = a[1];
     let len = a[2] as usize;
     let name = a[4];
     let namelen = a[5] as usize;
-    let Some(Sock::Datagram(_, recorded)) = map.get(&fd) else {
-        return notif_continue(lfd, id);
+    let (recorded, pair) = match map.get(&fd) {
+        Some(Sock::Datagram { dest, pair, .. }) => (*dest, pair.clone()),
+        _ => return notif_continue(lfd, id),
     };
-    let recorded = *recorded;
     let target = if name != 0 && namelen >= 4 {
         parse_sockaddr(&read_mem(mem, name, namelen.min(128))?)
             .map(|(_, ip, port)| (ip, port))
@@ -2054,26 +2154,31 @@ async fn handle_sendto(
     } else {
         recorded
     };
-    let Some((_ip, port)) = target else {
+    let Some((ip, port)) = target else {
         return notif_respond(lfd, id, -1, libc::EDESTADDRREQ);
     };
-    if port != DNS_PORT {
-        return notif_respond(lfd, id, -1, libc::ENETUNREACH);
-    }
-    let query = read_mem(mem, buf, len)?;
-    let Ok(parsed) = cfrs::vnet::dns::ParsedQuery::parse(&query) else {
-        return notif_respond(lfd, id, -1, libc::EINVAL);
-    };
-    let ip = dns.address_for(&parsed.name);
-    let reply = cfrs::vnet::dns::build_response(&parsed, &[IpAddr::V4(ip)], 0);
-    if let Some(Sock::Datagram(pair, _)) = map.get(&fd) {
+    if port == DNS_PORT {
+        let query = read_mem(mem, buf, len)?;
+        let Ok(parsed) = cfrs::vnet::dns::ParsedQuery::parse(&query) else {
+            return notif_respond(lfd, id, -1, libc::EINVAL);
+        };
+        let fake = dns.address_for(&parsed.name);
+        let reply = cfrs::vnet::dns::build_response(&parsed, &[IpAddr::V4(fake)], 0);
         let _ = pair.send(&reply).await;
+        return notif_respond(lfd, id, len as i64, 0);
     }
-    notif_respond(lfd, id, len as i64, 0)
+    let payload = read_mem(mem, buf, len)?;
+    match relay_datagram(map, fd, &proxies[0], pair, &payload, ip, port).await {
+        Ok(()) => notif_respond(lfd, id, len as i64, 0),
+        Err(e) => {
+            let _ = notif_respond(lfd, id, -1, libc::ENETUNREACH);
+            Err(e)
+        }
+    }
 }
 
 /// `sendmmsg` is what glibc's resolver uses: a vector of `mmsghdr`. Only the
-/// first message is answered; a DNS retry in the same call is rare.
+/// first message is answered.
 async fn handle_sendmmsg(
     lfd: RawFd,
     id: u64,
@@ -2081,6 +2186,7 @@ async fn handle_sendmmsg(
     mem: RawFd,
     map: &mut HashMap<i32, Sock>,
     dns: &mut FakeDns,
+    proxies: &[Proxy],
 ) -> Result<()> {
     let fd = a[0] as i32;
     let msgvec = a[1];
@@ -2089,7 +2195,16 @@ async fn handle_sendmmsg(
         return notif_respond(lfd, id, 0, 0);
     }
     // struct mmsghdr = struct msghdr (56 bytes) + u32 msg_len + padding.
-    handle_sendmsg(lfd, id, [fd as u64, msgvec, 0, 0, 0, 0], mem, map, dns).await
+    handle_sendmsg(
+        lfd,
+        id,
+        [fd as u64, msgvec, 0, 0, 0, 0],
+        mem,
+        map,
+        dns,
+        proxies,
+    )
+    .await
 }
 
 async fn handle_sendmsg(
@@ -2099,13 +2214,14 @@ async fn handle_sendmsg(
     mem: RawFd,
     map: &mut HashMap<i32, Sock>,
     dns: &mut FakeDns,
+    proxies: &[Proxy],
 ) -> Result<()> {
     let fd = a[0] as i32;
     let msg_ptr = a[1];
-    let Some(Sock::Datagram(_, recorded)) = map.get(&fd) else {
-        return notif_continue(lfd, id);
+    let (recorded, pair) = match map.get(&fd) {
+        Some(Sock::Datagram { dest, pair, .. }) => (*dest, pair.clone()),
+        _ => return notif_continue(lfd, id),
     };
-    let recorded = *recorded;
     // struct msghdr on x86_64: name, namelen, iov, iovlen, control, controllen, flags.
     let hdr = read_mem(mem, msg_ptr, 56)?;
     let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
@@ -2119,13 +2235,10 @@ async fn handle_sendmsg(
     } else {
         recorded
     };
-    let Some((_ip, port)) = target else {
+    let Some((ip, port)) = target else {
         return notif_respond(lfd, id, -1, libc::EDESTADDRREQ);
     };
-    if port != DNS_PORT {
-        return notif_respond(lfd, id, -1, libc::ENETUNREACH);
-    }
-    let mut query = Vec::new();
+    let mut payload = Vec::new();
     for i in 0..iov_len.min(8) {
         let iov = read_mem(mem, iov_ptr + (i as u64) * 16, 16)?;
         let base = u64::from_ne_bytes(iov[0..8].try_into().unwrap());
@@ -2133,17 +2246,124 @@ async fn handle_sendmsg(
         if len == 0 {
             continue;
         }
-        query.extend_from_slice(&read_mem(mem, base, len.min(4096))?);
+        payload.extend_from_slice(&read_mem(mem, base, len.min(65536))?);
     }
-    let Ok(parsed) = cfrs::vnet::dns::ParsedQuery::parse(&query) else {
-        return notif_respond(lfd, id, -1, libc::EINVAL);
-    };
-    let ip = dns.address_for(&parsed.name);
-    let reply = cfrs::vnet::dns::build_response(&parsed, &[IpAddr::V4(ip)], 0);
-    if let Some(Sock::Datagram(pair, _)) = map.get(&fd) {
+    if port == DNS_PORT {
+        let Ok(parsed) = cfrs::vnet::dns::ParsedQuery::parse(&payload) else {
+            return notif_respond(lfd, id, -1, libc::EINVAL);
+        };
+        let fake = dns.address_for(&parsed.name);
+        let reply = cfrs::vnet::dns::build_response(&parsed, &[IpAddr::V4(fake)], 0);
         let _ = pair.send(&reply).await;
+        return notif_respond(lfd, id, payload.len() as i64, 0);
     }
-    notif_respond(lfd, id, query.len() as i64, 0)
+    match relay_datagram(map, fd, &proxies[0], pair, &payload, ip, port).await {
+        Ok(()) => notif_respond(lfd, id, payload.len() as i64, 0),
+        Err(e) => {
+            let _ = notif_respond(lfd, id, -1, libc::ENETUNREACH);
+            Err(e)
+        }
+    }
+}
+
+/// Dial the proxy without sending a request; the caller speaks next.
+async fn dial_proxy(proxy: &Proxy) -> Result<Upstream> {
+    match &proxy.unix_path {
+        Some(path) => Ok(Box::new(
+            tokio::net::UnixStream::connect(path)
+                .await
+                .with_context(|| format!("connect to unix proxy {path}"))?,
+        )),
+        None => Ok(Box::new(
+            tokio::net::TcpStream::connect(proxy.endpoint())
+                .await
+                .with_context(|| format!("connect to proxy {}", proxy.endpoint()))?,
+        )),
+    }
+}
+
+/// Establish (once) the proxy's UDP association for this datagram socket and
+/// pump replies back to the child.
+async fn ensure_udp_relay(
+    map: &mut HashMap<i32, Sock>,
+    fd: i32,
+    proxy: &Proxy,
+    pair: Arc<tokio::net::UnixDatagram>,
+) -> Result<()> {
+    if matches!(map.get(&fd), Some(Sock::Datagram { relay: Some(_), .. })) {
+        return Ok(());
+    }
+    if proxy.kind != ProxyKind::Socks5 {
+        bail!("UDP relay needs a SOCKS5 proxy");
+    }
+    let control = dial_proxy(proxy).await?;
+    let (control, relay_addr) = socks5_udp_associate(control, proxy).await?;
+    let udp = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+    let reader = udp.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let Ok((n, _)) = reader.recv_from(&mut buf).await else {
+                break;
+            };
+            if n < 4 {
+                continue;
+            }
+            let off = match buf[3] {
+                0x01 => 10,
+                0x03 => 4 + 1 + buf[4] as usize + 2,
+                0x04 => 22,
+                _ => continue,
+            };
+            if n < off {
+                continue;
+            }
+            let _ = pair.send(&buf[off..n]).await;
+        }
+    });
+    if let Some(Sock::Datagram { relay, .. }) = map.get_mut(&fd) {
+        *relay = Some(UdpRelay {
+            udp,
+            relay_addr,
+            _control: control,
+        });
+    }
+    Ok(())
+}
+
+/// Wrap a datagram in a SOCKS5 UDP request header and send it to the relay.
+fn wrap_udp(payload: &[u8], ip: IpAddr, port: u16) -> Vec<u8> {
+    let mut out = vec![0u8, 0, 0];
+    match ip {
+        IpAddr::V4(v4) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.octets());
+        }
+    }
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+async fn relay_datagram(
+    map: &mut HashMap<i32, Sock>,
+    fd: i32,
+    proxy: &Proxy,
+    pair: Arc<tokio::net::UnixDatagram>,
+    payload: &[u8],
+    ip: IpAddr,
+    port: u16,
+) -> Result<()> {
+    ensure_udp_relay(map, fd, proxy, pair).await?;
+    let wrapped = wrap_udp(payload, ip, port);
+    if let Some(Sock::Datagram { relay: Some(r), .. }) = map.get(&fd) {
+        r.udp.send_to(&wrapped, r.relay_addr).await?;
+    }
+    Ok(())
 }
 
 fn handle_getsockopt(
@@ -2174,7 +2394,7 @@ fn handle_getsockopt(
     if level == libc::SOL_SOCKET && optname == libc::SO_TYPE {
         let ty = match entry {
             Sock::Stream(_) => libc::SOCK_STREAM,
-            Sock::Datagram(..) => libc::SOCK_DGRAM,
+            Sock::Datagram { .. } => libc::SOCK_DGRAM,
         };
         let b = (ty as u32).to_ne_bytes();
         val[..4].copy_from_slice(&b);
@@ -2204,7 +2424,7 @@ fn handle_sockname(
     // see an AF_UNIX socketpair.
     let (ip, port) = match entry {
         Sock::Stream(_) => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        Sock::Datagram(_, dest) => dest.unwrap_or((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+        Sock::Datagram { dest, .. } => dest.unwrap_or((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
     };
     let family = if ip.is_ipv4() {
         libc::AF_INET as u16

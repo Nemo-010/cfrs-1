@@ -115,3 +115,54 @@ The netns backend needs a host that permits user namespaces and has
 the pure parts (proxy-spec parsing, fake-IP stability, base64, target splitting,
 the SYN parser) and `tests/pod_netns_seccomp.rs` covers the whole path for both
 binary kinds.
+
+## Beyond TCP and DNS
+
+The seccomp backend is a platform, not a one-trick. Three extensions are in and
+tested; the interception point is what makes each cheap.
+
+### UDP, not just DNS
+
+UDP port 53 is answered locally from the fake-IP pool. Everything else on a
+datagram socket is now relayed through the proxy's **`UDP ASSOCIATE`**: the
+supervisor keeps the control connection, learns the relay address, wraps each
+datagram in a SOCKS5 UDP header, and a reader task strips the header from the
+replies and drops them into the child's socketpair. `tests/pod_netns_seccomp.rs`
+proves a UDP echo round trip (`UDP:9:ECHO:PING`).
+
+The sandbox permits UDP bind and send, so this is the one transport that was
+never blocked and now works end to end.
+
+### Chained proxies
+
+`-x` is repeatable and the hops are **chained**: dial the first, ask each hop to
+`CONNECT` to the next, and ask the last for the target. Each hop learns only the
+address of the next, which is the usual multi-hop property. A unix-socket hop is
+addressed as `unix:<path>` with port `0`, and the hop in front resolves it.
+
+```sh
+pod-netns --backend seccomp -x unix:/run/hop1.sock -x unix:/run/hop2.sock -- ./prog
+```
+
+The test asserts the first hop was asked for the second (`unix:…/p2.sock:0`)
+and only the second saw `93.184.216.34:80`.
+
+### Closing the `io_uring` bypass
+
+`io_uring` submits network operations without going through the intercepted
+syscalls, so a program using `IORING_OP_SOCKET`/`IORING_OP_CONNECT` would slip
+past the filter entirely. `io_uring_setup` is intercepted and answered `EPERM`.
+This sandbox already denies it, but the filter must not depend on that.
+
+### What is still open
+
+- **Per-destination routing** (`--rule domain:…=PROXY`, `cidr:…=PROXY`) is the
+  obvious next step: `connect_upstream_async` already takes a slice of hops, so
+  it needs a rule table and one call site, not new plumbing.
+- **Inbound** (`bind`/`listen`/`accept`) is answered only for the injected
+  socketpairs, so a server cannot be reached from outside yet.
+- **`getsockname`/`getpeername` faking** is limited: writing the child's memory
+  needs `O_RDWR` on `/proc/<pid>/mem`, which this host denies, so those calls
+  fall through to the kernel and report the `AF_UNIX` address.
+- **`io_uring`-based `recvmsg`** would also bypass, so denying the whole
+  interface is deliberate rather than partial.
