@@ -22,9 +22,14 @@ pub mod cloudflare;
 pub mod config;
 pub mod feature;
 pub mod origin;
+pub mod ports;
 pub mod proxy;
 pub mod quicktunnel;
 pub mod relay;
+pub mod share;
 pub mod transport;
 pub mod tunnel;
 pub mod util;
+pub mod vnet;
+
+pub use vnet::{NetStack, StackConfig, VirtAddr, VirtualSubnet};

@@ -66,7 +66,7 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 /// with the `=` padding omitted. Emitting padding here produces a value the
 /// edge's decoder rejects.
 pub fn base64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b = [
             chunk[0],
@@ -341,14 +341,45 @@ pub fn build_visitor_request(
         .cloned()
         .collect();
 
-    let mut builder = http::Request::builder()
+    // Build the request so that one bad header costs only that header.
+    //
+    // The original chained every header onto one `Request::builder` and, on
+    // failure, replaced the entire request with `http::Request::new(())`, which
+    // is a bare GET to `/` with no headers: one bad header turned any request
+    // into a GET of the root. Not chaining is not enough either, because a
+    // poisoned builder rejects everything after it and still fails at `body()`.
+    // So the head is built first and each header is validated on its own, and the
+    // invalid ones are dropped individually, which is what an intermediary does.
+    let mut head = match http::Request::builder()
         .method(method)
         .uri(path)
-        .header("host", authority);
+        .header("host", authority)
+        .body(())
+    {
+        Ok(request) => request,
+        Err(e) => {
+            // Only the method and the URI can fail here, and both come from the
+            // edge. Reporting beats forwarding something else.
+            tracing::warn!(error = %e, "could not build the visitor request");
+            return http::Request::new(());
+        }
+    };
+
+    // Append rather than replace, so the host set above survives.
     for (name, value) in &replayed {
-        builder = builder.header(name.as_str(), value.as_str());
+        match (
+            http::header::HeaderName::try_from(name.as_str()),
+            http::HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(name), Ok(value)) => {
+                head.headers_mut().append(name, value);
+            }
+            _ => {
+                tracing::warn!(header = name, "dropped a header the HTTP/2 layer refused");
+            }
+        }
     }
-    builder.body(()).unwrap_or_else(|_| http::Request::new(()))
+    head
 }
 
 /// Headers that describe one hop rather than the message.
@@ -370,9 +401,17 @@ pub fn build_origin_response(
             // wire as well as inside the serialized blob.
             real.push((lower.clone(), value.clone()));
         }
-        if !is_control_header(&lower) {
-            // Everything else is serialized, so that HTTP/2 header validation
-            // is not applied to values that came from an HTTP/1 origin.
+        if !is_control_header(&lower) && !is_hop_by_hop(&lower) {
+            // Hop-by-hop headers are dropped here for the same reason they are
+            // dropped on the request path: they describe one connection, and the
+            // edge is framing the body itself. Replaying an origin's
+            // `Transfer-Encoding: chunked` next to the edge's own HTTP/2 framing
+            // gives the visitor two disagreeing answers about where the body
+            // ends, which is the shape of a response-splitting bug.
+            //
+            // The serialized blob is validated by neither HTTP/2 nor the origin,
+            // so skipping validation is the reason the value is serialized at
+            // all. That is not a reason to replay a connection-scoped header.
             serialized.push((name.clone(), value.clone()));
         }
     }
@@ -457,6 +496,79 @@ pub fn is_control_header(name: &str) -> bool {
 mod tests {
     use super::super::Credentials;
     use super::*;
+
+    /// Response headers that are scoped to one connection and must not reach the
+    /// visitor. Mirrors the request path's filter.
+    const HOP_BY_HOP: &[&str] = &[
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Authenticate",
+        "Proxy-Authorization",
+        "TE",
+        "Trailer",
+        "Transfer-Encoding",
+        "Upgrade",
+    ];
+
+    #[test]
+    fn a_response_drops_hop_by_hop_headers_like_the_request_does() {
+        let mut headers: Vec<(String, String)> = vec![
+            ("content-type".into(), "text/plain".into()),
+            ("x-keep-me".into(), "yes".into()),
+        ];
+        for name in HOP_BY_HOP {
+            headers.push(((*name).to_string(), "chunked".into()));
+        }
+        let (status, real) = build_origin_response(200, &headers);
+        assert_eq!(status, 200);
+
+        let serialized = real
+            .iter()
+            .find(|(name, _)| name == RESPONSE_HEADERS_HEADER)
+            .map(|(_, value)| value.clone())
+            .expect("the serialized blob is always present");
+        let decoded = decode_headers(&serialized);
+
+        for name in HOP_BY_HOP {
+            assert!(
+                !decoded.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)),
+                "{name} is connection-scoped and must not be replayed: {decoded:?}"
+            );
+        }
+        assert!(
+            decoded
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == "text/plain"),
+            "content-type describes the body and must survive: {decoded:?}"
+        );
+        assert!(
+            decoded
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("x-keep-me") && v == "yes"),
+            "an end-to-end header must survive: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_keeps_its_method_and_path_when_a_header_is_refused() {
+        // A header the http crate rejects must not take the whole request with
+        // it. What this pins is the visitor's POST becoming a GET of `/`.
+        let headers = vec![
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("bad header".to_string(), "value".to_string()),
+        ];
+        let request = build_visitor_request("POST", "/api/submit?x=1", "example.test", &headers);
+        assert_eq!(request.method(), "POST", "the method must survive");
+        assert_eq!(request.uri().path(), "/api/submit", "the path must survive");
+        assert_eq!(request.uri().query(), Some("x=1"), "the query must survive");
+        assert_eq!(request.headers().get("host").unwrap(), "example.test");
+        assert_eq!(
+            request.headers().get("content-type").unwrap(),
+            "text/plain",
+            "a good header beside a bad one must still be forwarded"
+        );
+    }
+
 
     #[test]
     fn the_control_stream_headers_match_the_source() {

@@ -245,8 +245,13 @@ pub fn parse_quick_tunnel_response(status: u16, body: &str) -> Result<QuickTunne
         });
     }
 
+    // The provisioning body carries the tunnel's `secret`, `account_tag` and `id`,
+    // which are the credentials the edge expects at registration. A decode
+    // failure therefore has a body that is mostly credentials, and this error
+    // reaches the operator's stderr and any CI log. Redact before including any
+    // of it.
     let parsed: QuickTunnelResponse = serde_json::from_str(body)
-        .map_err(|e| ProvisionError::Decode(format!("{e}; body was: {}", truncate(body, 200))))?;
+        .map_err(|e| ProvisionError::Decode(format!("{e}; body was: {}", redact(body))))?;
 
     if !parsed.success {
         return Err(ProvisionError::Service(parsed.errors));
@@ -255,11 +260,70 @@ pub fn parse_quick_tunnel_response(status: u16, body: &str) -> Result<QuickTunne
     parsed.result.ok_or(ProvisionError::MissingResult)
 }
 
+/// Replace the credential-bearing fields of a provisioning body with a marker,
+/// then clip it to something readable.
+///
+/// A provisioning response is mostly secret: `secret` is a 32-byte base64 blob
+/// and `account_tag` identifies the account, and both are what the edge expects
+/// at registration. Including the body in an error is useful for debugging a
+/// malformed response, but including the credentials in a log is a leak its
+/// readers cannot see. So the values are replaced rather than the whole body
+/// dropped, which keeps the diagnostic and loses nothing that matters.
+fn redact(body: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    let mut out = String::with_capacity(body.len());
+    // One pass over the body, checking each key at every position. The keys are
+    // few and the body is short, so matching repeatedly per key would work too,
+    // but a single cursor cannot get the boundaries wrong: `copied` is always
+    // bytes the scan has already accepted.
+    let keys: [&str; 4] = ["secret", "account_tag", "tunnel_secret", "id"];
+    let mut i = 0;
+    while i < body.len() {
+        let mut matched: Option<&str> = None;
+        for key in keys {
+            let needle = format!("\"{key}\"");
+            if body[i..].starts_with(&needle) {
+                matched = Some(key);
+                break;
+            }
+        }
+        let Some(key) = matched else {
+            let ch = body[i..].chars().next().expect("i is a boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+        // Copy the key and its colon, then replace the value in quotes.
+        let needle_len = key.len() + 2;
+        let after_key = i + needle_len;
+        let Some(colon) = body[after_key..].find(':') else {
+            break;
+        };
+        let after_colon = after_key + colon + 1;
+        let Some(open) = body[after_colon..].find('"').map(|p| after_colon + p + 1) else {
+            break;
+        };
+        let Some(close) = body[open + 1..].find('"').map(|p| open + 1 + p) else {
+            break;
+        };
+        out.push_str(&body[i..open + 1]);
+        out.push_str(REDACTED);
+        i = close + 1;
+    }
+    truncate(&out, 200)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
     } else {
-        format!("{}...", &s[..n])
+        // Clip on a character boundary: a raw byte cut can land inside a
+        // multi-byte character and panic on the next slice.
+        let mut cut = n;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &s[..cut])
     }
 }
 
@@ -306,6 +370,73 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::redact;
+
+    /// A body shaped like the real provisioning response, with values that are
+    /// recognisable so a leak in a log is visible.
+    const REAL_BODY: &str = r#"{"success":true,"result":{"id":"2983af16-7c68-4ef0-9590-e05f35a0cd7b","name":"qt-x","hostname":"foo.trycloudflare.com","account_tag":"5ab4e9dfbd435d24068829fda0077963","secret":"GlUwcZAOuFFaHRtTTFqbk1WVmpWMHFzOGdSSUthbG1K"}}"#;
+
+    #[test]
+    fn redaction_removes_every_credential_from_the_error_text() {
+        let redacted = redact(REAL_BODY);
+        assert!(
+            !redacted.contains("GlUwcZAOuFFaHRtTTFqbk1WVmpWMHFzOGdSSUthbG1K"),
+            "the tunnel secret must not survive redaction: {redacted}"
+        );
+        assert!(
+            !redacted.contains("5ab4e9dfbd435d24068829fda0077963"),
+            "the account tag must not survive redaction: {redacted}"
+        );
+        assert!(
+            !redacted.contains("2983af16-7c68-4ef0-9590-e05f35a0cd7b"),
+            "the tunnel id must not survive redaction: {redacted}"
+        );
+        assert!(
+            redacted.contains("<redacted>"),
+            "the redaction marker should be visible: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_the_fields_a_human_needs() {
+        let redacted = redact(REAL_BODY);
+        assert!(
+            redacted.contains("foo.trycloudflare.com"),
+            "the hostname is the part that identifies which tunnel this was: {redacted}"
+        );
+        assert!(redacted.contains(r#""secret""#), "the key should remain: {redacted}");
+    }
+
+    #[test]
+    fn redaction_survives_a_body_that_is_not_json() {
+        // A hostile or intercepted endpoint can return anything. The error path
+        // must not panic on it.
+        for body in [
+            "",
+            "{",
+            "not json at all",
+            "{\"secret\":",
+            "{\"secret\":\"unterminated",
+            r#"{"secret":"a","secret":"b"}"#,
+            r#"{"nested":{"account_tag":"x"},"id":"y"}"#,
+        ] {
+            let out = redact(body);
+            assert!(!out.contains("unterminated") || body.len() < 40, "{body:?} -> {out:?}");
+        }
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // The original clipped at a raw byte offset, which panics when the cut
+        // lands inside a multi-byte character.
+        let text = "é".repeat(400);
+        let out = super::truncate(&text, 200);
+        assert!(out.ends_with("..."));
+        assert!(out.is_char_boundary(out.len() - 3));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+
     use super::*;
 
     /// A response captured from a real `POST https://api.trycloudflare.com/tunnel`

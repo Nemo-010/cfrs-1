@@ -24,6 +24,8 @@ USAGE:
     cfrs qr [URL]                Print a QR code for a URL
     cfrs doctor                  Report what this machine can reach
     cfrs metrics                 Print the tunnel counters
+    cfrs ports                   List local TCP ports that are listening
+    cfrs net SUBCOMMAND           Userspace virtual network (no AF_INET)
     cfrs version                 Show the version
 
 tunnel OPTIONS:
@@ -70,12 +72,37 @@ connect OPTIONS:
         -L, --local SPEC          Local target, repeatable
         --url URL                 The remote WebSocket to bridge
 
+net SUBCOMMAND:
+    cfrs net demo                Run the in-process TCP handshake proof
+    cfrs net doctor              Probe what this host permits
+    cfrs net addresses           Print the virtual address plan
+    cfrs net shim [--out DIR]    Build the LD_PRELOAD shim, print its env
+    cfrs net proxy [OPTIONS]    SOCKS5 / HTTP CONNECT into the virtual net
+
+net shim OPTIONS:
+        --out DIR                Where to build when no shim is found
+        --log                    Log every translation
+        --map-loopback           Rewrite 127.0.0.1 to the stack's address
+        --json                   Print the environment as JSON
+
+net proxy OPTIONS:
+        --listen SPEC            unix:/path or tcp://[bind:]port
+                                  [default: unix:/tmp/cfrsnet.socks]
+        --map NAME=ADDR          Resolve NAME to ADDR, repeatable
+        --forward VIRT=REAL      Forward a virtual endpoint to a real one,
+                                  repeatable. REAL is host:port or unix:/path
+        --port N                 Default port for clients that omit one
+        --run-for SECONDS        Exit after N seconds
+
 EXAMPLES:
     cfrs tunnel --url http://localhost:8080
     cfrs tunnel --unix /run/app.sock --protocol http2
     cfrs tunnel --config ./config.yml
     cfrs provision
     cfrs serve --unix-socket /run/app.sock
+    cfrs net demo
+    cfrs net shim --out ./cfrsnet --log
+    cfrs net proxy --forward 10.66.0.2:8080=unix:/run/app.sock
 ";
 
 fn main() -> ExitCode {
@@ -97,6 +124,8 @@ fn main() -> ExitCode {
         Some("qr") => cmd_qr(&args[1..]),
         Some("doctor") => cmd_doctor(&args[1..]),
         Some("metrics") => cmd_metrics(&args[1..]),
+        Some("ports") => cmd_ports(),
+        Some("net") => cmd_net(&args[1..]),
         Some(other) => {
             eprintln!("cfrs: unknown command {other:?}\n");
             eprint!("{USAGE}");
@@ -527,6 +556,241 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
 fn cmd_metrics(_args: &[String]) -> Result<(), String> {
     print!("{}", cfrs::util::metrics::Metrics::new().render());
     Ok(())
+}
+
+fn cmd_ports() -> Result<(), String> {
+    let ports = cfrs::ports::listening_ports();
+    if ports.is_empty() {
+        println!("cfrs: no listening TCP ports found");
+        return Ok(());
+    }
+    for port in ports {
+        println!("{port}");
+    }
+    Ok(())
+}
+
+/// Every flag `net` accepts, used to reject typos loudly.
+const NET_FLAGS: &[&str] = &["out", "log", "map-loopback", "json"];
+const NET_PROXY_FLAGS: &[&str] = &["listen", "map", "forward", "port", "run-for"];
+
+fn cmd_net(args: &[String]) -> Result<(), String> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err("net needs a subcommand: demo, doctor, addresses, shim, proxy".into());
+    };
+    let rest = &args[1..];
+
+    match sub {
+        "demo" => {
+            let report = cfrs::vnet::stack::loopback_proof();
+            print!("{}", report.render());
+            if !report.passed() {
+                return Err("the userspace TCP proof did not complete".into());
+            }
+            Ok(())
+        }
+        "doctor" => {
+            let probes = cfrs::vnet::doctor::run();
+            print!("{}", cfrs::vnet::doctor::render(&probes));
+            Ok(())
+        }
+        "addresses" => {
+            let subnet = cfrs::vnet::VirtualSubnet::default();
+            println!("cfrsnet: v4 subnet {}", subnet.v4);
+            println!("cfrsnet: v6 subnet {}", subnet.v6);
+            println!(
+                "cfrsnet: gateway  {} / {}",
+                subnet.gateway(cfrs::vnet::Family::V4),
+                subnet.gateway(cfrs::vnet::Family::V6)
+            );
+            let local = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 66, 0, 2));
+            for port in [53u16, 80, 443, 8080] {
+                let addr = cfrs::vnet::VirtAddr::new(local, port);
+                println!(
+                    "cfrsnet: {addr:<20} \\0{}",
+                    addr.abstract_name().map_err(|e| e.to_string())?
+                );
+            }
+            Ok(())
+        }
+        "shim" => cmd_net_shim(rest),
+        "proxy" => cmd_net_proxy(rest),
+        other => Err(format!(
+            "unknown net subcommand {other:?}; expected demo, doctor, addresses, shim, proxy"
+        )),
+    }
+}
+
+fn cmd_net_shim(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args)?;
+    flags.reject_unknown(NET_FLAGS)?;
+
+    // A shim found next to a previous build is reused only when the caller
+    // named no output directory. `--out` always rebuilds, so a stale binary is
+    // never silently preferred over the source in this repository.
+    let directory = flags.get("out").map_or_else(
+        || std::env::temp_dir().join("cfrsnet"),
+        |dir| std::path::PathBuf::from(dir),
+    );
+    let shim = match cfrs::vnet::shim::locate() {
+        Some(shim) if !flags.present("out") => shim,
+        _ => cfrs::vnet::shim::build(&directory).map_err(|e| e.to_string())?,
+    };
+    let options = cfrs::vnet::shim::ShimOptions {
+        log: flags.present("log"),
+        map_loopback: flags.present("map-loopback"),
+        ..cfrs::vnet::shim::ShimOptions::default()
+    };
+    let env = options.environment(&shim.path);
+
+    if flags.present("json") {
+        let object: serde_json::Map<String, serde_json::Value> = env
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value)))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&object).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    println!("cfrs: shim     {}", shim.path.display());
+    println!("cfrs: origin   {:?}", shim.origin);
+    for (key, value) in &env {
+        println!("  export {key}={value}");
+    }
+    Ok(())
+}
+
+/// A real destination a virtual forward bridges to.
+#[derive(Clone, Debug)]
+enum RealTarget {
+    Tcp(std::net::SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+impl RealTarget {
+    fn parse(value: &str) -> Result<Self, String> {
+        if let Some(path) = value.strip_prefix("unix:") {
+            #[cfg(unix)]
+            {
+                if path.is_empty() {
+                    return Err("unix: real destination has no path".into());
+                }
+                return Ok(Self::Unix(std::path::PathBuf::from(path)));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err("unix destinations are not supported on this platform".into());
+            }
+        }
+        value
+            .parse()
+            .map(Self::Tcp)
+            .map_err(|_| format!("bad real address {value:?}"))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Tcp(addr) => addr.to_string(),
+            #[cfg(unix)]
+            Self::Unix(path) => format!("unix:{}", path.display()),
+        }
+    }
+}
+
+fn cmd_net_proxy(args: &[String]) -> Result<(), String> {
+    use cfrs::vnet::proxy::{ProxyListen, Resolver};
+
+    let flags = Flags::parse(args)?;
+    flags.reject_unknown(NET_PROXY_FLAGS)?;
+
+    let mut resolver = Resolver::new();
+    for entry in flags.all("map") {
+        let (name, address) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("--map wants NAME=ADDRESS, got {entry:?}"))?;
+        let address: std::net::IpAddr = address
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad address in {entry:?}"))?;
+        resolver.insert(name.trim().to_ascii_lowercase(), address);
+    }
+
+    let listen = ProxyListen::parse(flags.get("listen").unwrap_or("unix:/tmp/cfrsnet.socks"))
+        .map_err(|e| e.to_string())?;
+    let default_port: u16 = match flags.get("port") {
+        Some(p) => p.parse().map_err(|_| "--port expects a number".to_string())?,
+        None => 80,
+    };
+    let run_for: Option<u64> = match flags.get("run-for") {
+        Some(s) => Some(s.parse().map_err(|_| "--run-for expects seconds".to_string())?),
+        None => None,
+    };
+
+    // The runtime is built here rather than in main, because the other
+    // subcommands are synchronous and this one is the only async command.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    runtime.block_on(async move {
+        let net = std::sync::Arc::new(cfrs::vnet::NetStack::loopback());
+        let mut proxy =
+            cfrs::vnet::proxy::serve(net.clone(), listen, resolver, default_port)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        for spec in flags.all("forward") {
+            let (virt, real) = spec
+                .split_once('=')
+                .ok_or_else(|| format!("--forward wants VIRT=REAL, got {spec:?}"))?;
+            let virt: cfrs::vnet::VirtAddr = virt
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad virtual address {virt:?}"))?;
+            let target = RealTarget::parse(real.trim())?;
+            let dial_target = target.clone();
+            proxy.spawn_forwards(net.clone(), virt, move || {
+                let target = dial_target.clone();
+                async move { target.dial().await }
+            });
+            println!("cfrs: forward  {virt} -> {}", target.describe());
+        }
+
+        match &proxy.listen {
+            ProxyListen::Unix(path) => println!("cfrs: proxy    unix:{}", path.display()),
+            ProxyListen::Tcp(addr) => println!("cfrs: proxy    tcp://{addr}"),
+        }
+
+        match run_for {
+            Some(secs) => tokio::time::sleep(std::time::Duration::from_secs(secs)).await,
+            None => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        proxy.abort();
+        Ok(())
+    })
+}
+
+/// Type-erasure for the forwarded stream, so one forward can bridge to either
+/// a TCP or a unix socket.
+trait DialStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> DialStream for T {}
+
+impl RealTarget {
+    async fn dial(&self) -> std::io::Result<Box<dyn DialStream>> {
+        match self {
+            Self::Tcp(addr) => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
+            #[cfg(unix)]
+            Self::Unix(path) => Ok(Box::new(tokio::net::UnixStream::connect(path).await?)),
+        }
+    }
 }
 
 fn resolve_proxy(explicit: Option<&str>) -> Option<String> {

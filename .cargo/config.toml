@@ -1,0 +1,5 @@
+# cfrs's userspace stack owns the local address, the gateway (where the
+# virtual resolver listens) and their IPv6 counterparts. smoltcp defaults
+# IFACE_MAX_ADDR_COUNT to 2, which cannot hold all four, so raise it.
+[env]
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "4"

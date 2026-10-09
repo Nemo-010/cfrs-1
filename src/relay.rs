@@ -385,7 +385,7 @@ fn pick_tunnel_url(text: &str) -> Option<String> {
     let candidates: Vec<&str> = text
         .split_whitespace()
         .filter(|t| t.starts_with("http://") || t.starts_with("https://"))
-        .map(|t| t.trim_end_matches(|c: char| c == ',' || c == '.' || c == ')' || c == '\"'))
+        .map(|t| t.trim_end_matches([',', '.', ')', '"']))
         .collect();
 
     for url in &candidates {

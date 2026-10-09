@@ -1,2 +1,6 @@
 /target
 __pycache__/
+# Build output lands under the exec root, which is a sibling of the tree.
+/target*
+# Abstract and filesystem sockets the virtual network and the relay create.
+*.sock

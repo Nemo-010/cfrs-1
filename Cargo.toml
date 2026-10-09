@@ -62,6 +62,26 @@ hickory-resolver = { version = "0.24", default-features = false, features = [
 serde_yaml = "0.9"
 # Terminal QR code for the public URL.
 qrcode = { version = "0.14", default-features = false }
+# The rest of this crate reports errors with its own `FeatureError` and
+# `std::io::Error`. The `vnet` module (ported from the reference implementation
+# of the userspace network) reports them with `anyhow`, which is left as-is
+# rather than rewritten: its error paths span a TCP state machine and a packet
+# codec, and the context chain is the point.
+anyhow = "1"
+tracing = "0.1"
+# Userspace virtual network: a real TCP/IP stack over an in-process link, so a
+# program can bind and connect 10.66.0.x without an AF_INET syscall. Pinned
+# exactly, because smoltcp's device and wire APIs are not covered by semver.
+smoltcp = { version = "=0.11.0", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+] }
+# AtomicWaker: the stack's poll loop parks on it instead of spinning.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 # getrandom-backed OS entropy for the ephemeral SSH key. Pinned to the same
 # ssh-key line russh uses so the CryptoRng trait bounds unify.
 ssh-key = { version = "0.7.0-rc.11", features = ["getrandom"] }
@@ -69,6 +89,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# The shim tests compile C programs and run them under LD_PRELOAD.
+tempfile = "3"
 
 [profile.release]
 opt-level = 2

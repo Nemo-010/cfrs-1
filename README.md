@@ -24,6 +24,14 @@ from the sandbox this was written in, so that part could not be tested against
 the real edge either. `cfrs serve` is the path that produces a working public
 URL here.
 
+**A third thing, since the last revision.** `cfrs net` gives a process a real
+IP address space without `AF_INET`, a network namespace or `CAP_NET_ADMIN`: an
+`LD_PRELOAD` shim rewrites `AF_INET` sockets to `AF_UNIX` abstract sockets, and
+a `smoltcp` stack owns a private `10.66.0.0/24`. This works, and it is
+independent of the tunnel: `cfrs net demo` proves a TCP handshake and transfer
+in-process with no kernel socket at all. See *Userspace virtual networking*
+below and [`VIRTUAL-NETWORK.md`](./VIRTUAL-NETWORK.md).
+
 ## Install
 
 ```sh
@@ -48,6 +56,72 @@ cfrs doctor
 
 `serve` reads `$HTTPS_PROXY` by default and accepts `--proxy host:port`.
 Set `CFRS_DEBUG=1` to trace every visitor channel and byte count.
+
+```sh
+# Run the userspace TCP proof: a handshake and a request/response with no
+# kernel AF_INET call anywhere.
+cfrs net demo
+
+# Give a program an address space it can bind and connect on.
+cfrs net shim --out ./cfrsnet --log
+cfrs net doctor                    # what this host permits, measured now
+cfrs net addresses                 # the address plan and its abstract names
+
+# List local TCP ports that are already listening.
+cfrs ports
+```
+
+## Userspace virtual networking
+
+When a host refuses `AF_INET` binds entirely, `cfrs net` gives a process an
+address space anyway. Two layers, usable separately and composed:
+
+1. **Socket interposition.** `cfrs net shim` builds an `LD_PRELOAD` library that
+   rewrites every `AF_INET`/`AF_INET6` socket to an `AF_UNIX` abstract socket
+   named `\0cfrsnet/<family>/<address>/<port>`. An ordinary program binds and
+   connects normally, and two interposed programs talk to each other with no host
+   process at all.
+
+   ```sh
+   cfrs net shim --out /tmp/cfrsnet --log   # prints the environment to export
+   LD_PRELOAD=/tmp/cfrsnet/libcfrsnet.so ./your-server
+   ```
+
+2. **A userspace IP stack.** `smoltcp` owns a private `10.66.0.0/24` and
+   `fd00:66::/64` network over an in-process link. The library type is
+   `cfrs::vnet::NetStack`, and `cfrs net proxy` exposes it to programs that
+   cannot be interposed: a SOCKS5 / HTTP `CONNECT` front door on a unix socket
+   that forwards virtual endpoints to real services.
+
+   ```sh
+   cfrs net proxy --forward 10.66.0.2:8080=unix:/run/app.sock
+   ALL_PROXY=socks5h:///tmp/cfrsnet.socks curl http://10.66.0.2:8080/
+   ```
+
+**What is proven, and how.** The claim is that no `AF_INET` syscall reaches the
+kernel. `cfrs net demo` shows a full TCP handshake and a request/response inside
+the userspace stack, but that is the stack talking to itself, so it is not by
+itself evidence about the kernel. `tests/af_inet_kernel.rs` is: it binds
+`AF_INET 10.66.0.2:18091` in a real process with the shim preloaded, reads the
+socket's inode from `/proc/self/fd`, and asserts the kernel files it under
+`/proc/net/unix` and not `/proc/net/tcp`. The inode is used because the shim
+interposes `getsockname`, so a probe built on that would measure the shim's own
+bookkeeping; this was tried first and it answered `inet`. The control is the
+same probe with no shim, which must fail with `EACCES`, or the host is not
+sealed and nothing else in the file means anything.
+
+`tests/shim_no_socket.rs` covers the programs the first test does not: ones that
+close a descriptor, duplicate one, or ask for a socket name before they ever open
+a socket. Those are the majority of programs, and they are where the port found
+its worst bug.
+
+Other subcommands: `cfrs net demo`, `cfrs net doctor` (the measured constraint
+table, re-run on the running host), `cfrs net addresses`, `cfrs net shim` and
+`cfrs net proxy`. The library adds `vnet::dns` (a virtual resolver),
+`vnet::policy` (connect-time ACLs) and `vnet::record` (pcap capture and
+deterministic replay). What is still open, including the single-waker caveat and
+the unwired control server, is listed in §11 of
+[`VIRTUAL-NETWORK.md`](./VIRTUAL-NETWORK.md).
 
 ## What was measured, and where the boundary is
 
@@ -266,12 +340,17 @@ without binding a socket, which a sandbox may refuse to do.
 | `src/transport/` | SSH and WebSocket relays |
 | `src/tunnel/mod.rs` | configuration, ingress routing, request preparation |
 | `src/feature/mod.rs` | QR rendering and the feature flag surface |
+| `src/share.rs` | path-token and PIN-gate access control for a public session |
+| `src/ports.rs` | local listening TCP ports, from `/proc/net/tcp{,6}` |
+| `src/vnet/` | the userspace IP stack: `addr`, `device`, `stack`, `dns`, `socks`, `proxy`, `policy`, `record`, `control`, `doctor`, `framing`, `shim` |
+| `shim/cfrsnet.c` | the `LD_PRELOAD` socket interposer, built by `cfrs net shim` |
 | `src/util/` | HTTP head parsing, TLS helpers, metrics |
-| `src/bin/cfrs.rs` | CLI: `tunnel`, `provision`, `serve`, `connect`, `qr`, `doctor`, `metrics` |
+| `src/bin/cfrs.rs` | CLI: `tunnel`, `provision`, `serve`, `connect`, `qr`, `doctor`, `metrics`, `ports`, `net` |
 | `tools/cf-origin.rs` | test origin, serves over a unix socket with a marker |
 | `tools/prove-exposure.sh` | end-to-end proof, origin to public URL |
 | `tools/check-header-oracle.sh` | diff our header encoding against cloudflared's own Go code |
 | `tools/header-oracle.txt` | captured oracle output, asserted by a test |
+| `VIRTUAL-NETWORK.md` | the design and measured constraints behind `src/vnet/` |
 
 ## Tests
 
@@ -279,7 +358,7 @@ without binding a socket, which a sandbox may refuse to do.
 cargo test
 ```
 
-211 tests, including a provisioning response captured from the live service, the
+332 tests, including a provisioning response captured from the live service, the
 allow-list refusal string, byte-coalescing on the CONNECT response, URL
 extraction from real relay output, and the splice ordering regression above.
 
@@ -287,9 +366,28 @@ The header-encoding tests are checked against `tools/header-oracle.txt` rather
 than against literals typed into the test, which is deliberate: a base64 literal
 written by eye is easy to get wrong and hard to notice.
 
+The tests under `tests/` are the ones that had to be argued for. Each of them
+was written after the failure was reproduced, and each was then checked by
+removing the fix to confirm the test goes red:
+
+| file | what it pins |
+| --- | --- |
+| `tests/af_inet_kernel.rs` | the kernel files a mapped socket as `AF_UNIX`, measured by socket inode, with the sealed-host control |
+| `tests/shim_direct.rs` | two unmodified programs exchange data over abstract names |
+| `tests/shim_no_socket.rs` | programs that never open a socket keep working |
+| `tests/vnet_regressions.rs` | the UTF-8 truncation panic, the decoder wedge, the socket leak and the poll-interval knob |
+
 `tools/check-header-oracle.sh` is not part of `cargo test`. Run it to rebuild
 the Go reference and re-diff; it needs a Go toolchain, so it is kept out of the
 test run so that `cargo test` works without one.
+
+Two environmental notes, because they look like failures and are not. Build
+output must land on a filesystem that can `execve`: a test that compiles a C
+program and runs it will fail with `Permission denied` on a `noexec` mount, and
+`TMPDIR` has to point somewhere that can run binaries. And an abstract socket
+name is one global namespace for the whole host, so every test that binds one
+uses its own port; two tests sharing a port produce a `bind-failed` that reads
+exactly like a shim that failed to interpose.
 
 ## Licence
 

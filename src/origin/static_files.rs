@@ -78,8 +78,8 @@ impl StaticDir {
     ///
     /// The traversal check is the important part: a request for
     /// `../../etc/passwd` must not reach outside the served directory. Path
-    /// components are checked lexically and the result is confirmed to still
-    /// start with the root.
+    /// components are checked lexically, and then the path is **canonicalised**,
+    /// because a lexical check alone does not survive a symlink.
     fn resolve(&self, rel: &str) -> Option<(PathBuf, bool)> {
         let decoded = percent_decode(rel);
         let candidate = Path::new(&decoded);
@@ -100,12 +100,22 @@ impl StaticDir {
             }
         }
 
-        if !out.starts_with(&self.dir) {
+        // Resolve symlinks and compare the *resolved* path against the *resolved*
+        // root. `starts_with` on the constructed path is a component-prefix
+        // comparison and does not look at what the path points at, so a symlink
+        // inside the served tree pointing outside it passes: with
+        // `static:/srv/www` and `/srv/www/leak -> /etc/shadow`, a request for
+        // `/leak` yields the components of `/srv/www/leak`, which starts with
+        // `/srv/www`, and the file is then read. Canonicalising is what makes
+        // the claim true rather than merely plausible.
+        let root = std::fs::canonicalize(&self.dir).ok()?;
+        let resolved = std::fs::canonicalize(&out).ok()?;
+        if !resolved.starts_with(&root) {
             return None;
         }
 
-        let meta = std::fs::metadata(&out).ok()?;
-        Some((out, meta.is_dir()))
+        let meta = std::fs::metadata(&resolved).ok()?;
+        Some((resolved, meta.is_dir()))
     }
 }
 
@@ -365,6 +375,50 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&secret);
+    }
+
+    #[test]
+    fn a_symlink_out_of_the_root_is_refused() {
+        // The lexical traversal check cannot see a symlink, so a link inside the
+        // served tree pointing outside it passes the component check and then
+        // reads the target. The fix is to canonicalise before comparing roots,
+        // and this is the test for it: it fails on any implementation that only
+        // checks the path it constructed.
+        let d = tmpdir("symlink");
+        std::fs::write(d.join("index.html"), b"idx").unwrap();
+        let outside = d.parent().unwrap().join("cfrs-symlink-target");
+        std::fs::write(&outside, b"SECRET").unwrap();
+
+        let link = d.join("leak");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let s = StaticDir::new(&d);
+        let mut rec = Recorder::default();
+        s.respond(&req("/leak"), &mut rec).unwrap();
+        assert_ne!(
+            rec.status, 200,
+            "a symlink out of the served root must not be served"
+        );
+        assert!(
+            !String::from_utf8_lossy(&rec.body).contains("SECRET"),
+            "the symlink leaked file content from outside the root"
+        );
+
+        // A symlink that stays inside the root is still served: the point is to
+        // keep the origin, not to ban links.
+        let inner = d.join("real.html");
+        std::fs::write(&inner, b"inside").unwrap();
+        let inner_link = d.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&inner, &inner_link).unwrap();
+
+        let mut rec = Recorder::default();
+        s.respond(&req("/alias"), &mut rec).unwrap();
+        assert_eq!(rec.status, 200, "a link inside the root should still work");
+        assert!(String::from_utf8_lossy(&rec.body).contains("inside"));
+
+        let _ = std::fs::remove_file(&outside);
     }
 
     #[test]
