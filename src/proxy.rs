@@ -41,13 +41,35 @@ pub fn connect_tunnel(
     port: u16,
     timeout: Duration,
 ) -> io::Result<TunnelStream<TcpStream>> {
+    connect_tunnel_with_auth(proxy_addr, host, port, timeout, None)
+}
+
+/// Open a CONNECT tunnel, optionally authenticating to the proxy.
+///
+/// A `Proxy-Authorization: Basic` header is sent when credentials are given.
+/// Proxies that require it answer `407` rather than `403`, and the status is
+/// surfaced so a missing credential can be told from a blocked destination.
+pub fn connect_tunnel_with_auth(
+    proxy_addr: &str,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    credentials: Option<(&str, &str)>,
+) -> io::Result<TunnelStream<TcpStream>> {
     let mut stream = TcpStream::connect(proxy_addr)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    let request = format!(
-        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    let mut request = format!(
+        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Connection: Keep-Alive\r\n"
     );
+    if let Some((user, pass)) = credentials {
+        request.push_str(&format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64_encode(format!("{user}:{pass}").as_bytes())
+        ));
+    }
+    request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
@@ -60,6 +82,53 @@ pub fn connect_tunnel(
     }
 
     Ok(TunnelStream { stream, leftover })
+}
+
+/// Standard base64, written out so proxy auth and the WebSocket
+/// handshake key need no extra dependency.
+pub fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Strip an `http://` or `https://` prefix from a proxy address.
+///
+/// A CONNECT proxy address is `host:port`; the URL form is what
+/// `HTTPS_PROXY` usually holds, so both are accepted.
+pub fn strip_scheme(value: String) -> String {
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = value.strip_prefix(scheme) {
+            return rest.to_string();
+        }
+    }
+    value
+}
+
+/// Alias for [`base64_encode`], for callers outside this module.
+pub fn base64_encode_pub(input: &[u8]) -> String {
+    base64_encode(input)
 }
 
 /// Read the CONNECT response head, returning the status line and any bytes

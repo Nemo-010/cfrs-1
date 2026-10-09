@@ -18,6 +18,13 @@
 //! edge; [`relay`] is the transport that completes a working public URL without
 //! it. See `README.md` for the measurements behind that split.
 
+pub mod cloudflare;
+pub mod config;
+pub mod feature;
+pub mod origin;
 pub mod proxy;
 pub mod quicktunnel;
 pub mod relay;
+pub mod transport;
+pub mod tunnel;
+pub mod util;

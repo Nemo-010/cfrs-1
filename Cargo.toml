@@ -1,13 +1,13 @@
 [package]
 name = "cfrs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Cloudflare quick-tunnel client, written in Rust, for constrained sandboxes"
+description = "A Cloudflare Tunnel client in Rust: quick tunnels, named tunnels, QUIC and HTTP/2 edge transports, unix-socket and TCP origins"
 license = "0BSD"
 repository = "https://github.com/talaria0101/cfrs"
 readme = "README.md"
-keywords = ["cloudflare", "tunnel", "quick-tunnel", "trycloudflare", "ssh"]
+keywords = ["cloudflare", "tunnel", "quick-tunnel", "trycloudflare", "argotunnel", "quic"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
@@ -21,12 +21,53 @@ serde_json = "1"
 # SSH remote forwarding, for environments where the Cloudflare tunnel edge is
 # not reachable and a TCP relay over port 443 is.
 russh = "0.64"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# QUIC transport for the Cloudflare edge (ALPN "argotunnel", SNI quic.cftunnel.com).
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+# HTTP/2 transport for the Cloudflare edge (SNI h2.cftunnel.com, empty ALPN).
+h2 = "0.4"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "fs",
+    "sync",
+    "signal",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+# DNS: resolve the edge SRV record, and serve DNS when asked.
+hickory-resolver = { version = "0.24", default-features = false, features = [
+    "tokio-runtime",
+    "system-config",
+] }
+# Config file parsing, matching cloudflared's config.yml shape.
+serde_yaml = "0.9"
+# Terminal QR code for the public URL.
+qrcode = { version = "0.14", default-features = false }
 # getrandom-backed OS entropy for the ephemeral SSH key. Pinned to the same
 # ssh-key line russh uses so the CryptoRng trait bounds unify.
 ssh-key = { version = "0.7.0-rc.11", features = ["getrandom"] }
+libc = "0.2"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full"] }
 
 [profile.release]
 opt-level = 2
