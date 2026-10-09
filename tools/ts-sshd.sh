@@ -89,7 +89,10 @@ chmod 755 "$dir/errandsh" "$dir/faketty"
 cc -O2 -shared -fPIC -o "$dir/fakepty.so" "$dir/fakepty.c" -ldl
 cc -O2 -o "$dir/unixsockd" "$here/../shim/unixsockd.c"
 
-sed "s|@DIR@|$dir|g" "$here/../shim/loginshell" > "$dir/loginshell"
+sed -e "s|@DIR@|$dir|g" \
+    -e "s|@FAKEPWD@|$shims/fakepwd.so|g" \
+    -e "s|@PASSWD@|$shims/passwd|g" \
+    "$here/../shim/loginshell" > "$dir/loginshell"
 chmod 755 "$dir/loginshell"
 
 # Point the synthetic users at that login shell.
