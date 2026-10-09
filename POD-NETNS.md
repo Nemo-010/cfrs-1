@@ -182,6 +182,21 @@ filter would be unsound: the kernel performs the submitted network operations
 itself, so there is no syscall for the filter to see. Denying the interface is
 the only correct answer, and `the_filter_covers_the_bypass_surfaces` asserts it.
 
+### Front door: an instance as a hop
+
+`--serve unix:/path` makes an instance speak SOCKS5 and HTTP `CONNECT` and
+forward each request through its own upstream chain. Instances therefore chain
+with each other, and one can stand in for a shim's front door:
+
+```sh
+pod-netns --serve unix:/run/front.sock -x unix:/run/upstream.sock &
+pod-netns --backend seccomp -x unix:/run/front.sock -- ./prog
+```
+
+`--serve` reuses `cfrs::vnet::socks` for the request parsing and
+`cfrs::vnet::proxy::ProxyListen` for the listen spec, so the server side is the
+library's, not a second implementation.
+
 ### Remaining host limits
 
 **`getsockname`/`getpeername` address rewriting.** The supervisor needs

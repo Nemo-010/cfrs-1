@@ -217,6 +217,7 @@ struct Args {
     doctor: bool,
     verbose: bool,
     inbound_dir: std::path::PathBuf,
+    serve: Option<cfrs::vnet::proxy::ProxyListen>,
     backend: BackendKind,
 }
 
@@ -248,6 +249,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     let mut verbose = false;
     let mut backend = BackendKind::Auto;
     let mut inbound_dir = std::path::PathBuf::from("/tmp/pod-netns-inbound");
+    let mut serve: Option<cfrs::vnet::proxy::ProxyListen> = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -297,6 +299,14 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 });
                 i += 2;
             }
+            "--serve" => {
+                let spec = argv.get(i + 1).context("--serve needs a listen spec")?;
+                serve = Some(
+                    cfrs::vnet::proxy::ProxyListen::parse(spec)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                );
+                i += 2;
+            }
             "--inbound-dir" => {
                 inbound_dir = std::path::PathBuf::from(
                     argv.get(i + 1).context("--inbound-dir needs a value")?,
@@ -316,7 +326,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             other => bail!("unexpected argument {other:?}; see --help"),
         }
     }
-    if !doctor && program.is_empty() {
+    if !doctor && serve.is_none() && program.is_empty() {
         bail!("nothing to run; usage: pod-netns [OPTIONS] -- PROGRAM");
     }
     Ok(Args {
@@ -326,6 +336,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         doctor,
         verbose,
         inbound_dir,
+        serve,
         backend,
     })
 }
@@ -1719,6 +1730,111 @@ mod tests {
     }
 }
 
+// ── front door: pod-netns as a proxy for others ─────────────────────────────
+
+enum FrontListener {
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener),
+}
+
+impl FrontListener {
+    async fn accept(&self) -> std::io::Result<Upstream> {
+        match self {
+            FrontListener::Unix(l) => Ok(Box::new(l.accept().await?.0)),
+            FrontListener::Tcp(l) => Ok(Box::new(l.accept().await?.0)),
+        }
+    }
+}
+
+/// Serve SOCKS5 and HTTP `CONNECT`, forwarding each request through the
+/// configured upstream chain. This makes an instance a hop for another, and a
+/// drop-in replacement for a shim's front door.
+async fn serve_front_door(
+    listen: cfrs::vnet::proxy::ProxyListen,
+    chain: Vec<Proxy>,
+    rules: Vec<Rule>,
+    verbose: bool,
+) -> Result<()> {
+    use cfrs::vnet::proxy::ProxyListen;
+    let listener = match &listen {
+        ProxyListen::Unix(path) => {
+            let _ = std::fs::remove_file(path);
+            FrontListener::Unix(tokio::net::UnixListener::bind(path)?)
+        }
+        ProxyListen::Tcp(addr) => FrontListener::Tcp(tokio::net::TcpListener::bind(addr).await?),
+    };
+    eprintln!(
+        "pod-netns: serving {} ({} upstream)",
+        listen_str(&listen),
+        chain.len()
+    );
+    loop {
+        let conn = listener.accept().await?;
+        let chain = chain.clone();
+        let rules = rules.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_one(conn, &chain, &rules, verbose).await {
+                if verbose {
+                    eprintln!("pod-netns: front door: {e:#}");
+                }
+            }
+        });
+    }
+}
+
+fn listen_str(listen: &cfrs::vnet::proxy::ProxyListen) -> String {
+    match listen {
+        cfrs::vnet::proxy::ProxyListen::Unix(p) => format!("unix:{}", p.display()),
+        cfrs::vnet::proxy::ProxyListen::Tcp(a) => format!("tcp://{a}"),
+    }
+}
+
+async fn serve_one(conn: Upstream, chain: &[Proxy], rules: &[Rule], verbose: bool) -> Result<()> {
+    use cfrs::vnet::socks;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let mut reader = tokio::io::BufReader::new(conn);
+    let first = {
+        let buf = reader.fill_buf().await?;
+        buf.first().copied()
+    };
+    let (request, is_socks5) = match first {
+        Some(5) => (socks::socks5_read_request(&mut reader).await?, true),
+        Some(_) => (socks::http_read_connect(&mut reader).await?, false),
+        None => return Ok(()),
+    };
+    let target = format!("{}:{}", request.host, request.port);
+    let selected = select_chain(rules, chain, &target);
+    if verbose {
+        eprintln!(
+            "pod-netns: front door {target} via {}",
+            selected[0].endpoint()
+        );
+    }
+    let mut upstream = match connect_upstream_async(selected, &target).await {
+        Ok(u) => u,
+        Err(e) => {
+            if is_socks5 {
+                let _ = socks::socks5_reply(
+                    &mut reader,
+                    socks::socks5_code_for_error(&e.to_string()),
+                    None,
+                )
+                .await;
+            } else {
+                let _ = socks::http_connect_reply(&mut reader, 502, "Bad Gateway").await;
+            }
+            return Err(e);
+        }
+    };
+    if is_socks5 {
+        socks::socks5_reply(&mut reader, 0x00, None).await?;
+    } else {
+        socks::http_connect_ok(&mut reader).await?;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut reader, &mut upstream).await;
+    Ok(())
+}
+
 // ── seccomp user-notification backend ───────────────────────────────────────
 //
 // Where a network namespace is denied, a seccomp filter that returns
@@ -2765,6 +2881,36 @@ fn main() {
     };
     if args.doctor {
         std::process::exit(doctor());
+    }
+    if args.serve.is_some() {
+        if args.proxies.is_empty() {
+            eprintln!("pod-netns: --serve needs at least one -x upstream");
+            std::process::exit(2);
+        }
+        let listen = args.serve.clone().unwrap();
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("pod-netns: {e:#}");
+                std::process::exit(EXIT_NO_BACKEND);
+            }
+        };
+        let outcome = runtime.block_on(serve_front_door(
+            listen,
+            args.proxies.clone(),
+            args.rules.clone(),
+            args.verbose,
+        ));
+        match outcome {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("pod-netns: {e:#}");
+                std::process::exit(EXIT_NO_BACKEND);
+            }
+        }
     }
     let result = match args.backend {
         BackendKind::Netns => run(args),

@@ -432,3 +432,44 @@ fn seccomp_backend_accepts_inbound() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn pod_netns_serves_a_front_door_and_chains_with_itself() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let echo = dir.join("echo.sock");
+    let front = dir.join("front.sock");
+    let listener = UnixListener::bind(&echo).unwrap();
+    let (tx, _rx) = mpsc::channel();
+    std::thread::spawn(move || socks5_proxy(listener, tx, false));
+
+    // One instance serves SOCKS5 and forwards through the echo proxy.
+    let mut server = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--serve"])
+        .arg(format!("unix:{}", front.display()))
+        .args(["-x"])
+        .arg(format!("unix:{}", echo.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if front.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A second instance runs a client through the first one's front door.
+    let program = build_program(&dir, "client-serve", CLIENT, false);
+    let stdout = run(&dir, &[&front], &program);
+    assert!(stdout.contains("READ:18:HELLO-FROM-TARGET"), "{stdout:?}");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
