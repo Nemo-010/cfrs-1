@@ -170,7 +170,9 @@ Every interposer above can only reach a *dynamic* binary. `pod-netns` is the
 kernel-enforced answer: it runs a program in a network namespace whose only
 interface is a TUN the parent drives with the `cfrs` userspace stack, so any
 program — static, Go, libc-free — has its egress forced through a SOCKS5/HTTP
-proxy. `pod-netns doctor` measures what the host permits first. See
+proxy. `pod-netns doctor` measures what the host permits first, and
+`-x tailscale:<socket>` makes the tailnet the transport by dialling the
+daemon's `ts-dial` LocalAPI directly, with no front door and no shim. See
 [`POD-NETNS.md`](./POD-NETNS.md).
 
 ## What was measured, and where the boundary is

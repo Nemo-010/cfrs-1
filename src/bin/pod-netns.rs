@@ -71,6 +71,9 @@ const EXIT_NO_BACKEND: i32 = 3;
 enum ProxyKind {
     Socks5,
     Http,
+    /// Not a proxy at all: dial the target through a running `tailscaled`'s
+    /// LocalAPI `ts-dial` endpoint, so the tailnet is the transport.
+    Tailscale,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +101,22 @@ impl Proxy {
             }
             return Ok(Self {
                 kind: ProxyKind::Socks5,
+                host: String::new(),
+                port: 0,
+                user: None,
+                pass: None,
+                unix_path: Some(path.to_string()),
+            });
+        }
+        if let Some(path) = spec
+            .strip_prefix("tailscale:")
+            .or_else(|| spec.strip_prefix("tailscale://"))
+        {
+            if path.is_empty() {
+                bail!("tailscale proxy {spec:?} has no socket path");
+            }
+            return Ok(Self {
+                kind: ProxyKind::Tailscale,
                 host: String::new(),
                 port: 0,
                 user: None,
@@ -1199,6 +1218,7 @@ async fn connect_upstream(proxy: &Proxy, target: &str) -> Result<tokio::net::Tcp
     match proxy.kind {
         ProxyKind::Socks5 => socks5_connect(stream, proxy, target).await,
         ProxyKind::Http => http_connect(stream, proxy, target).await,
+        ProxyKind::Tailscale => bail!("the tailscale hop is only available on the seccomp backend"),
     }
 }
 
@@ -1213,11 +1233,27 @@ pub type Upstream = Box<dyn AsyncStream>;
 /// address of the next one.
 async fn connect_upstream_async(chain: &[Proxy], target: &str) -> Result<Upstream> {
     let (first, rest) = chain.split_first().context("no proxy configured")?;
+    if first.kind == ProxyKind::Tailscale {
+        if !rest.is_empty() {
+            bail!("a tailscale hop cannot be chained with a proxy hop");
+        }
+        let path = first
+            .unix_path
+            .as_deref()
+            .context("tailscale hop has no socket")?;
+        let (host, port) = split_target(target)?;
+        let conn = cfrs::vnet::tailscale::Dialer::new(path)
+            .dial(&host, port)
+            .await
+            .with_context(|| format!("tailnet dial {target}"))?;
+        return Ok(Box::new(conn));
+    }
     let mut stream: Upstream = dial_proxy(first).await?;
     if rest.is_empty() {
         return match first.kind {
             ProxyKind::Socks5 => socks5_connect(stream, first, target).await,
             ProxyKind::Http => http_connect(stream, first, target).await,
+            ProxyKind::Tailscale => unreachable!("handled above"),
         };
     }
     for (i, hop) in chain.iter().enumerate().take(chain.len() - 1) {
@@ -1235,6 +1271,7 @@ async fn connect_upstream_async(chain: &[Proxy], target: &str) -> Result<Upstrea
     match last.kind {
         ProxyKind::Socks5 => socks5_connect(stream, last, target).await,
         ProxyKind::Http => http_connect(stream, last, target).await,
+        ProxyKind::Tailscale => bail!("a tailscale hop must be the only hop"),
     }
 }
 

@@ -182,6 +182,18 @@ filter would be unsound: the kernel performs the submitted network operations
 itself, so there is no syscall for the filter to see. Denying the interface is
 the only correct answer, and `the_filter_covers_the_bypass_surfaces` asserts it.
 
+### The tailnet as the transport
+
+`-x tailscale:/run/tailscale/tailscaled.sock` is not a proxy at all. The
+supervisor dials the target through a running daemon's LocalAPI `ts-dial`
+endpoint (`cfrs::vnet::tailscale::Dialer`), so the tailnet itself carries the
+connection and there is no SOCKS front door, shim or `LD_PRELOAD` anywhere in
+the path:
+
+```sh
+pod-netns --backend seccomp -x tailscale:/run/tailscale/tailscaled.sock -- ./prog
+```
+
 ### Front door: an instance as a hop
 
 `--serve unix:/path` makes an instance speak SOCKS5 and HTTP `CONNECT` and

@@ -473,3 +473,64 @@ fn pod_netns_serves_a_front_door_and_chains_with_itself() {
     let _ = server.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn seccomp_backend_dials_the_tailnet_with_no_shim() {
+    if !have_compiler() || !seccomp_available() {
+        eprintln!("skipping: no compiler or no SECCOMP_RET_USER_NOTIF");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pod-netns-ts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let api = dir.join("tailscaled.sock");
+    let listener = UnixListener::bind(&api).unwrap();
+    // A stand-in for tailscaled's LocalAPI: accept the ts-dial upgrade, greet,
+    // then echo.
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let mut c = match conn {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while c.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if !String::from_utf8_lossy(&head).contains("Upgrade: ts-dial") {
+                    return;
+                }
+                let _ = c.write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\nConnection: upgrade\r\n\r\n",
+                );
+                let _ = c.write_all(b"HELLO-FROM-TAILNET\n");
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = c.read(&mut buf) {
+                    if n == 0 || c.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let program = build_program(&dir, "client-ts", CLIENT, false);
+    let output = Command::new(env!("CARGO_BIN_EXE_pod-netns"))
+        .args(["--backend", "seccomp", "-x"])
+        .arg(format!("tailscale:{}", api.display()))
+        .arg("--")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("READ:19:HELLO-FROM-TAILNET"),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
