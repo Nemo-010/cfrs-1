@@ -2,5 +2,28 @@
 __pycache__/
 # Build output lands under the exec root, which is a sibling of the tree.
 /target*
+# ...and each standalone tool under tools/ has its own target directory, which
+# the rooted patterns above do not match.
+tools/*/target/
+# Compiled probe binaries. The .c file is the evidence and IS committed; the
+# binary is one `cc -O1` away. Built binaries are named without an extension, so
+# a single pattern covers them all.
+tools/*/probe/*[a-z0-9_]*
+!tools/*/probe/*.c
+!tools/*/probe/*.md
+# Compiled test fixtures. Each is built by a one-line command that the test
+# prints in its SKIP message when the fixture is absent, so committing the
+# binaries would add megabytes and hide the fact that they are generated.
+# The .c and .go sources stay: those are the fixtures.
+tools/*/testdata/dnsfix
+tools/*/testdata/cdyn
+tools/*/testdata/iclient
+tools/*/testdata/relayer
+tools/*/testdata/srv
+tools/*/testdata/ucli
+# The two Go fixtures are directories holding their source plus one binary, so
+# the binary is matched by name rather than by excluding the directory.
+tools/*/testdata/gs/gs
+tools/*/testdata/sg/sg
 # Abstract and filesystem sockets the virtual network and the relay create.
 *.sock

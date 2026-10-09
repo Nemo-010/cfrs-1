@@ -1,0 +1,19 @@
+[package]
+name = "pod-netns"
+version = "0.1.0"
+edition = "2021"
+description = "Give a program a userspace network it did not ask for, with no shims, no LD_PRELOAD and no namespaces"
+license = "0BSD"
+readme = "README.md"
+
+[[bin]]
+name = "pod-netns"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["socket", "process", "poll", "user", "fs"] }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
